@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "or-gymnax"
+version = "0.1.0"
+description = ""
+authors = ["Andrew Zheng <azheng92@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+jax = "^0.5.1"
+flax = "^0.10.4"
+chex = "^0.1.89"
+jaxtyping = "^0.2.38"
+gymnax = "^0.0.8"
+pooch = "^1.8.2"
+pandas = "^2.2.3"
+funcy = "^2.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
