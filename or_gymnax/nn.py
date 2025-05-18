@@ -5,6 +5,7 @@ from jax import Array
 from jaxtyping import Float
 from jax.nn.initializers import orthogonal, constant
 import numpy as np
+from typing import Any, Dict, Tuple
 
 
 class MLP(nn.Module):

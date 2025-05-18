@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from picard.environments.rideshare_dispatch import RideshareDispatch, ManhattanRideshareDispatch
+from or_gymnax.rideshare import RideshareDispatch, ManhattanRideshareDispatch
 
 
 def make(env_id: str, **env_kwargs):

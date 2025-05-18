@@ -7,7 +7,7 @@ license = "MIT"
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.11"
+python = "^3.10"
 jax = "^0.5.1"
 flax = "^0.10.4"
 chex = "^0.1.89"
@@ -16,6 +16,8 @@ gymnax = "^0.0.8"
 pooch = "^1.8.2"
 pandas = "^2.2.3"
 funcy = "^2.0"
+numpy = "1.26.4"
+jax = "0.5.2"  # Currently gymnax not compatible with higher versions
 
 
 [build-system]
