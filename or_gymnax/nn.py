@@ -1,3 +1,4 @@
+from typing import Any, Dict, Tuple
 from flax.struct import dataclass
 from flax import linen as nn
 import jax.numpy as jnp

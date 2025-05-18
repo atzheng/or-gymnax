@@ -352,6 +352,31 @@ class RidesharePricing(RideshareDispatch):
         return super().reset_env(key, params.dispatch_env_params)
 
 
+def load_manhattan_data():
+    root = "https://github.com/atzheng/nyc-taxi-simulator-data/releases/download/initial-release"
+    events_fname = pooch.retrieve(
+        f"{root}/manhattan-trips.parquet",
+        known_hash="md5:653f0d7d28348a3e998fdb38ef00ef47",
+    )
+    raw_events = pd.read_parquet(events_fname).head(self.n_events)
+    distance_matrix_fname = pooch.retrieve(
+        f"{root}/manhattan-distances.npy",
+        known_hash="md5:95fda63cbed95bdb094f3b76baa7c7b4",
+    )
+    distances_np = np.load(distance_matrix_fname)
+    # distances_np[distances_np == 0] = np.inf
+    # distances_np = distances_np * (1 - np.eye(distances_np.shape[0]))
+    distances = jnp.asarray(np.round(distances_np), dtype=int)
+
+    events = RideshareEvent(
+        jnp.asarray(raw_events["t"].values - raw_events["t"].values.min()),
+        jnp.asarray(raw_events["pickup_idx"].values),
+        jnp.asarray(raw_events["dropoff_idx"].values),
+    )
+
+    return events, distances
+
+
 class ManhattanRideshareDispatch(RideshareDispatch):
     def __init__(self, n_cars=10000, n_events=100000):
         super().__init__(n_cars=n_cars, n_nodes=4333, n_events=n_events)
@@ -359,31 +384,11 @@ class ManhattanRideshareDispatch(RideshareDispatch):
     @property
     def name(self) -> str:
         """Environment name."""
-        return "RideshareDispatch-v0"
+        return "ManhattanRideshareDispatch-v0"
 
     @property
     def default_params(self) -> EnvParams:
-        root = "https://github.com/atzheng/nyc-taxi-simulator-data/releases/download/initial-release"
-
-        events_fname = pooch.retrieve(
-            f"{root}/manhattan-trips.parquet",
-            known_hash="md5:653f0d7d28348a3e998fdb38ef00ef47",
-        )
-        raw_events = pd.read_parquet(events_fname).head(self.n_events)
-        distance_matrix_fname = pooch.retrieve(
-            f"{root}/manhattan-distances.npy",
-            known_hash="md5:95fda63cbed95bdb094f3b76baa7c7b4",
-        )
-        distances_np = np.load(distance_matrix_fname)
-        # distances_np[distances_np == 0] = np.inf
-        # distances_np = distances_np * (1 - np.eye(distances_np.shape[0]))
-        distances = jnp.asarray(np.round(distances_np), dtype=int)
-
-        events = RideshareEvent(
-            jnp.asarray(raw_events["t"].values - raw_events["t"].values.min()),
-            jnp.asarray(raw_events["pickup_idx"].values),
-            jnp.asarray(raw_events["dropoff_idx"].values),
-        )
+        events, distances = load_manhattan_data()
         return EnvParams(events=events, distances=distances, n_cars=self.n_cars)
 
 
@@ -394,31 +399,11 @@ class ManhattanRidesharePricing(RidesharePricing):
     @property
     def name(self) -> str:
         """Environment name."""
-        return "RidesharePricing-v0"
+        return "ManhattanRidesharePricing-v0"
 
     @property
     def default_params(self) -> PricingEnvParams:
-        root = "https://github.com/atzheng/nyc-taxi-simulator-data/releases/download/initial-release"
-
-        events_fname = pooch.retrieve(
-            f"{root}/manhattan-trips.parquet",
-            known_hash="md5:653f0d7d28348a3e998fdb38ef00ef47",
-        )
-        raw_events = (
-            pd.read_parquet(events_fname).sort_values("t").head(self.n_events)
-        )
-        distance_matrix_fname = pooch.retrieve(
-            f"{root}/manhattan-distances.npy",
-            known_hash="md5:95fda63cbed95bdb094f3b76baa7c7b4",
-        )
-        distances_np = np.load(distance_matrix_fname)
-        distances = jnp.asarray(np.round(distances_np), dtype=int)
-
-        events = RideshareEvent(
-            jnp.asarray(raw_events["t"].values - raw_events["t"].values.min()),
-            jnp.asarray(raw_events["pickup_idx"].values),
-            jnp.asarray(raw_events["dropoff_idx"].values),
-        )
+        events, distances = load_manhattan_data()
         return PricingEnvParams(
             dispatch_env_params=EnvParams(
                 events=events, distances=distances, n_cars=self.n_cars
