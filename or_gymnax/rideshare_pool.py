@@ -1,7 +1,6 @@
 """
 Pricing and dispatch ridesharing environments
 """
-from dataclasses import field
 from functools import partial
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -13,14 +12,8 @@ from jax import Array
 from jax import lax
 import jax.numpy as jnp
 from gymnax.environments import environment
-from gymnax.environments import spaces
 from jaxtyping import Float, Integer, Bool
-import funcy as f
-import pooch
-import numpy as np
-import pandas as pd
 
-from .nn import Policy, MLP
 from . import rideshare as rs
 
 
@@ -60,10 +53,8 @@ def insert_and_optimize_trip(
     # Figure out where to insert the new trip
     # ------------------------------------------------------
     is_active = times > time
-    pickup_mask = jnp.array([1, 0, 1, 0])
-    pickup_is_active = is_active[pickup_mask]
-    dropoff_mask = jnp.array([0, 1, 0, 1])
-    dropoff_is_active = is_active[dropoff_mask]
+    pickup_is_active = is_active[jnp.array([0, 2])]
+    dropoff_is_active = is_active[jnp.array([1, 3])]
     trip_is_active = jnp.logical_or(pickup_is_active, dropoff_is_active)
     num_active_trips = jnp.sum(trip_is_active)
 
@@ -71,6 +62,7 @@ def insert_and_optimize_trip(
     # for now; will handle via cond at end of function
     # Add a new trip if there is an open slot
     first_inactive_trip = jnp.argmin(trip_is_active)
+
     new_waypoints = (
         waypoints.at[first_inactive_trip * 2]
         .set(pickup_id)
@@ -84,13 +76,29 @@ def insert_and_optimize_trip(
         .set(jnp.inf)
     )  # Todo make this maxint
 
+    is_active = times > time
+    next_wp_idx = jax.lax.cond(
+        jnp.any(is_active),  # If any waypoints are active...
+        # ...find the next waypoint
+        lambda: jnp.argmin(jnp.where(times >= time, times, jnp.inf)),
+        # ...else, return the last completed waypoint
+        lambda: jnp.argmax(times),
+    )
+
+    next_wp_time = jax.lax.cond(
+        jnp.any(is_active),
+        lambda: times[next_wp_idx],
+        lambda: time,
+    )
+
     # Figure out where to insert the new trip
     # ------------------------------------------------------
     new_times, marginal_cost = optimize_waypoints(
         distances,
         new_waypoints,
         new_times_draft,
-        time,
+        waypoints[next_wp_idx],
+        next_wp_time,
     )
 
     marginal_cost_or_infeasible = jax.lax.cond(
@@ -106,7 +114,8 @@ def optimize_waypoints(
     distances: Integer[Array, "nodes nodes"],
     waypoints: Integer[Array, "max_waypoints"],
     times: Integer[Array, "max_waypoints"],
-    time: int,
+    start_waypoint: int,
+    start_time: int,
 ) -> Tuple[
     Integer[Array, "max_waypoints"],  # Completion times
     Integer[Array, "1"],  # Marginal cost
@@ -124,20 +133,7 @@ def optimize_waypoints(
     To do this we will later need to add a "routes" element to the envstate of
     length points_per_segment * max_waypoints
     """
-    is_active = times > time
-    next_wp_idx = jax.lax.cond(
-        jnp.any(is_active),  # If any waypoints are active...
-        # ...find the next waypoint
-        lambda: jnp.argmin(jnp.where(times >= time, times, jnp.inf)),
-        # ...else, return the last completed waypoint
-        lambda: jnp.argmax(times),
-    )
-
-    next_wp_time = jax.lax.cond(
-        jnp.any(is_active),
-        lambda: times[next_wp_idx],
-        lambda: time,
-    )
+    is_active = times > start_time
 
     # Compute marginal times for each possible waypoint ordering
     # ----------------------------------------------------------------------
@@ -155,26 +151,23 @@ def optimize_waypoints(
 
     # Map sequence indices → actual node indices
     seq_is_active = is_active[seqs]
-    # Replace inactive nodes with next_wp_idx,
+    # Replace inactive nodes with start_waypoint
     # so that the distance to complete them will be 0
-    seqs_replace_inactive = jnp.where(seq_is_active, seqs, next_wp_idx)
-    seqs_replace_inactive_wps = waypoints[seqs_replace_inactive]
+    seqs_replace_inactive = jnp.where(seq_is_active, seqs, start_waypoint)
+    seq_wps_with_start = jnp.concatenate(
+        (
+            jnp.repeat(start_waypoint, seqs.shape[0]).reshape(-1, 1),
+            jnp.where(seq_is_active, waypoints[seqs], start_waypoint)
+        ),
+        axis=1
+    )
 
     # Gather pair-wise edge lengths for every leg in every sequence
-    src = seqs_replace_inactive_wps[:, :-1]
-    dst = seqs_replace_inactive_wps[:, 1:]
+    src = seq_wps_with_start[:, :-1]
+    dst = seq_wps_with_start[:, 1:]
     leg_dists = distances[src, dst]  # (6,4)
     leg_marginal_times = jnp.cumsum(leg_dists, axis=1)
-    seq_completion_times = (
-        jnp.concatenate(
-            (
-                jnp.zeros((leg_marginal_times.shape[0], 1)),
-                leg_marginal_times,
-            ),
-            axis=1,
-        )
-        + next_wp_time
-    )
+    seq_completion_times = leg_marginal_times + start_time
     seq_marginal_time = leg_marginal_times[:, -1]
     wp_completion_times = jnp.where(
         is_active,
@@ -193,21 +186,8 @@ def optimize_waypoints(
     # Keep only valid waypoint orderings
     # -------------------------------------------------------------------------
     # Inactive nodes must come first
-    is_inactive_first = jnp.all(
+    is_valid_sequence = jnp.all(
         seq_is_active[:, :-1] <= seq_is_active[:, 1:], axis=1
-    )
-    # Cannot divert car from its current waypoint, so the first active node must
-    # be next_wp_idx
-    seq_is_active_or_next_wp = jnp.logical_or(
-        ~seq_is_active, seqs == next_wp_idx
-    )
-    is_inactive_or_next_wp_first = jnp.all(
-        seq_is_active_or_next_wp[:, :-1] >= seq_is_active_or_next_wp[:, 1:],
-        axis=1,
-    )
-    is_valid_sequence = jnp.logical_and(
-        is_inactive_first,
-        is_inactive_or_next_wp_first,
     )
 
     # Get the best ordering and marginal cost
@@ -217,6 +197,7 @@ def optimize_waypoints(
     )
     best_seq_times = wp_completion_times[best_sequence_idx]
     best_marginal_cost = seq_marginal_time[best_sequence_idx]
+
     return best_seq_times, best_marginal_cost
 
 
@@ -306,6 +287,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         )
         new_waypoints = state.waypoints.at[car_id].set(new_car_wps)
         new_times = state.times.at[car_id].set(new_car_times)
+
         next_event = rs.get_nth_event(params.events, state.time + 1)
         next_state = EnvState(
             time=state.time + 1,
