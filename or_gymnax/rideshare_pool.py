@@ -54,7 +54,9 @@ class EnvState(environment.EnvState):
     event: rs.RideshareEvent
 
 
-def insert_and_optimize_trip(distances, waypoints, times, pickup_id, dropoff_id, time):
+def insert_and_optimize_trip(
+    distances, waypoints, times, pickup_id, dropoff_id, time
+):
     # Figure out where to insert the new trip
     # ------------------------------------------------------
     is_active = times > time
@@ -69,12 +71,18 @@ def insert_and_optimize_trip(distances, waypoints, times, pickup_id, dropoff_id,
     # for now; will handle via cond at end of function
     # Add a new trip if there is an open slot
     first_inactive_trip = jnp.argmin(trip_is_active)
-    new_waypoints = waypoints.at[
-        first_inactive_trip * 2 : first_inactive_trip * 2 + 1
-    ].set(jnp.array([pickup_id, dropoff_id]))
-    new_times_draft = times.at[
-        first_inactive_trip * 2 : first_inactive_trip * 2 + 1
-    ].set(jnp.array([jnp.inf, jnp.inf]))  # Todo make this maxint
+    new_waypoints = (
+        waypoints.at[first_inactive_trip * 2]
+        .set(pickup_id)
+        .at[first_inactive_trip * 2 + 1]
+        .set(dropoff_id)
+    )
+    new_times_draft = (
+        times.at[first_inactive_trip * 2]
+        .set(jnp.inf)
+        .at[first_inactive_trip * 2 + 1]
+        .set(jnp.inf)
+    )  # Todo make this maxint
 
     # Figure out where to insert the new trip
     # ------------------------------------------------------
@@ -87,8 +95,8 @@ def insert_and_optimize_trip(distances, waypoints, times, pickup_id, dropoff_id,
 
     marginal_cost_or_infeasible = jax.lax.cond(
         num_active_trips == MAX_ACTIVE_TRIPS,
-        jnp.inf,
-        marginal_cost,
+        lambda: jnp.inf,
+        lambda: marginal_cost,
     )
 
     return new_waypoints, new_times, marginal_cost_or_infeasible
@@ -157,17 +165,28 @@ def optimize_waypoints(
     dst = seqs_replace_inactive_wps[:, 1:]
     leg_dists = distances[src, dst]  # (6,4)
     leg_marginal_times = jnp.cumsum(leg_dists, axis=1)
-    seq_completion_times = jnp.concatenate(
-        (
-            jnp.zeros((leg_marginal_times.shape[0], 1)),
-            leg_marginal_times + next_wp_time,
-        ),
-        axis=1,
+    seq_completion_times = (
+        jnp.concatenate(
+            (
+                jnp.zeros((leg_marginal_times.shape[0], 1)),
+                leg_marginal_times,
+            ),
+            axis=1,
+        )
+        + next_wp_time
     )
     seq_marginal_time = leg_marginal_times[:, -1]
     wp_completion_times = jnp.where(
         is_active,
-        jnp.zeros_like(seqs).at[seqs].set(seq_completion_times),
+        jnp.zeros_like(seqs)
+        .at[
+            jnp.tile(
+                jnp.expand_dims(jnp.arange(seqs.shape[0]), axis=1),
+                seqs.shape[1],
+            ).flatten(),
+            seqs.flatten(),
+        ]
+        .set(seq_completion_times.flatten()),
         times,  # If already completed, don't change it
     )
 
@@ -180,10 +199,10 @@ def optimize_waypoints(
     # Cannot divert car from its current waypoint, so the first active node must
     # be next_wp_idx
     seq_is_active_or_next_wp = jnp.logical_or(
-        seq_is_active, seqs == next_wp_idx
+        ~seq_is_active, seqs == next_wp_idx
     )
     is_inactive_or_next_wp_first = jnp.all(
-        seq_is_active_or_next_wp[:, :-1] <= seq_is_active_or_next_wp[:, 1:],
+        seq_is_active_or_next_wp[:, :-1] >= seq_is_active_or_next_wp[:, 1:],
         axis=1,
     )
     is_valid_sequence = jnp.logical_and(
@@ -202,15 +221,88 @@ def optimize_waypoints(
 
 
 class RidesharePoolDispatch(rs.RideshareDispatch):
+    def step_env(
+        self,
+        key: chex.PRNGKey,
+        state: EnvState,
+        action: int,
+        params: rs.EnvParams,
+    ) -> Tuple[chex.Array, EnvState, jnp.ndarray, jnp.ndarray, Dict[Any, Any]]:
+        """Performs step transitions in the environment."""
+        return jax.lax.cond(
+            action >= 0,
+            lambda: self.step_env_dispatch(key, state, action, params),
+            lambda: self.step_env_unfulfill(key, state, action, params),
+        )
+
+    def step_env_unfulfill(
+        self,
+        key: chex.PRNGKey,
+        state: EnvState,
+        action: int,
+        params: rs.EnvParams,
+    ) -> Tuple[chex.Array, EnvState, jnp.ndarray, jnp.ndarray, Dict[Any, Any]]:
+        next_event = rs.get_nth_event(params.events, state.time + 1)
+        next_state = EnvState(
+            time=state.time + 1,
+            waypoints=state.waypoints,
+            times=state.times,
+            key=state.key,
+            event=next_event,
+        )
+        done = self.is_terminal(next_state, params)
+        reward = 0.0
+        return (
+            lax.stop_gradient(self.get_obs(next_state)),
+            lax.stop_gradient(next_state),
+            jnp.array(reward, dtype=float),
+            done,
+            {"discount": self.discount(state, params)},
+        )
+
+    def step_env_dispatch(
+        self,
+        key: chex.PRNGKey,
+        state: EnvState,
+        action: int,
+        params: rs.EnvParams,
+    ) -> Tuple[chex.Array, EnvState, jnp.ndarray, jnp.ndarray, Dict[Any, Any]]:
+        new_car_wps, new_car_times, marginal_cost = insert_and_optimize_trip(
+            params.distances,
+            state.waypoints[action],
+            state.times[action],
+            state.event.src,
+            state.event.dest,
+            state.event.t,
+        )
+        next_state = self.dispatch_and_update_state(state, action, params)
+        done = self.is_terminal(next_state, params)
+
+        # TODO Should place these into envparams
+        trip_cost = params.distances[state.event.src, state.event.dest]
+        profit_margin = 0.3
+        reward = (
+            trip_cost * (1 + profit_margin) - marginal_cost  # price  # cost
+        )
+
+        return (
+            lax.stop_gradient(self.get_obs(next_state)),
+            lax.stop_gradient(next_state),
+            jnp.array(reward, dtype=float),
+            done,
+            {"discount": self.discount(state, params)},
+        )
+
     def dispatch_and_update_state(
         self, state: EnvState, car_id: int, params: rs.EnvParams
     ) -> EnvState:
-        new_car_wps, new_car_times, marginal_costs = insert_and_optimize_trip(
+        new_car_wps, new_car_times, _ = insert_and_optimize_trip(
+            params.distances,
             state.waypoints[car_id],
             state.times[car_id],
             state.event.src,
             state.event.dest,
-            state.time,
+            state.event.t,
         )
         new_waypoints = state.waypoints.at[car_id].set(new_car_wps)
         new_times = state.times.at[car_id].set(new_car_times)
@@ -223,6 +315,25 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             event=next_event,
         )
         return next_state
+
+    def reset_env(
+        self, key: chex.PRNGKey, params: rs.EnvParams
+    ) -> Tuple[chex.Array, EnvState]:
+        """Performs resetting of environment."""
+        key, key_reset = jax.random.split(key)
+        state = EnvState(
+            time=0,
+            # Initialize empty waypoints and times
+            waypoints=jax.random.choice(
+                key_reset,
+                jnp.arange(self.n_nodes),
+                (self.n_cars, MAX_ACTIVE_TRIPS * 2),
+            ),
+            times=jnp.zeros((self.n_cars, MAX_ACTIVE_TRIPS * 2), dtype=int),
+            key=key,
+            event=rs.get_nth_event(params.events, 0),
+        )
+        return self.get_obs(state), state
 
     def get_obs(self, state: EnvState, params=None, key=None) -> chex.Array:
         """Applies observation function to state."""
@@ -251,13 +362,102 @@ class ManhattanRidesharePoolDispatch(RidesharePoolDispatch):
         )
 
 
+@struct.dataclass
+class GreedyPolicy(rs.GreedyPolicy):
+    """
+    A simple greedy policy that selects the car with the lowest
+    marginal cost for pooled rides, accounting for existing waypoints.
+    """
+
+    def get_costs(
+        self,
+        env_params: rs.EnvParams,
+        rng: chex.PRNGKey,
+        event: rs.RideshareEvent,
+        waypoints: Integer[Array, "n_cars max_waypoints"],
+        times: Integer[Array, "n_cars max_waypoints"],
+        params: Dict,
+    ):
+        # For each car, compute marginal cost of adding this trip
+        def get_car_cost(car_waypoints, car_times):
+            _, _, marginal_cost = insert_and_optimize_trip(
+                env_params.distances,
+                car_waypoints,
+                car_times,
+                event.src,
+                event.dest,
+                event.t,
+            )
+            return marginal_cost
+
+        costs = jax.vmap(get_car_cost)(waypoints, times)
+        return costs
+
+    def apply(
+        self,
+        env_params: rs.EnvParams,
+        nn_params: Dict,
+        obs: Integer[Array, "o_dim"],
+        rng: chex.PRNGKey,
+    ):
+        event, waypoints, times = obs_to_state(
+            self.n_cars, MAX_ACTIVE_TRIPS * 2, obs
+        )
+        rng, cost_rng = jax.random.split(rng)
+        rewards = -self.get_costs(
+            env_params, cost_rng, event, waypoints, times, nn_params
+        )
+
+        action = jax.random.choice(
+            rng,
+            jnp.arange(self.n_cars),
+            p=jnp.exp((rewards - jnp.max(rewards)) / self.temperature),
+        )
+        return action, {}
+
+
 if __name__ == "__main__":
-    n_events = 100
-    key = jax.random.PRNGKey(0)
-    env = ManhattanRidesharePricing(n_cars=10000, n_events=n_events)
-    env_params = env.default_params
-    print(env_params)
-    A = SimplePricingPolicy(n_cars=env.n_cars, price_per_distance=0.1)
+    # Create a small test environment
+    n_events = 10
+    n_cars = 3
+    key = jax.random.PRNGKey(10)
+    src_key, dest_key = jax.random.split(key)
+
+    # Initialize environment with simple distance matrix
+    env = RidesharePoolDispatch(n_cars=n_cars, n_nodes=5, n_events=n_events)
+    env_params = rs.EnvParams(
+        events=rs.RideshareEvent(
+            t=jnp.arange(n_events),
+            src=jax.random.randint(src_key, (n_events,), 0, 5),
+            dest=jax.random.randint(dest_key, (n_events,), 0, 5),
+        ),
+        distances=jnp.ones((5, 5)) - jnp.eye(5),  # Unit distances except self
+        n_cars=n_cars,
+    )
+
+    # Initialize greedy policy
+    policy = GreedyPolicy(n_cars=n_cars, temperature=0.1)
+
+    # Run a few steps
     obs, state = env.reset(key, env_params)
-    action, action_info = A.apply(env_params, dict(), obs, key)
-    new_obs, new_state, reward, _, _ = env.step(key, state, action, env_params)
+    print("\nInitial state:")
+    print(
+        f"Event: t={state.event.t}, src={state.event.src}, dest={state.event.dest}"
+    )
+    print(f"Car waypoints:\n{state.waypoints}")
+    print(f"Car times:\n{state.times}")
+
+    for i in range(3):
+        key, step_key = jax.random.split(key)
+        action, _ = policy.apply(env_params, {}, obs, step_key)
+        obs, state, reward, done, info = env.step(
+            step_key, state, action, env_params
+        )
+        print(f"\nStep {i+1}:")
+        print(f"Selected car: {action}")
+        print(f"Reward: {reward}")
+        print(
+            f"Event: t={state.event.t}, src={state.event.src}, dest={state.event.dest}"
+        )
+        print(f"Car waypoints:\n{state.waypoints}")
+        print(f"Car times:\n{state.times}")
