@@ -358,7 +358,8 @@ def load_manhattan_data():
         f"{root}/manhattan-trips.parquet",
         known_hash="md5:653f0d7d28348a3e998fdb38ef00ef47",
     )
-    raw_events = pd.read_parquet(events_fname)
+    raw_events = pd.read_parquet(events_fname).sort_values("t")
+
     distance_matrix_fname = pooch.retrieve(
         f"{root}/manhattan-distances.npy",
         known_hash="md5:95fda63cbed95bdb094f3b76baa7c7b4",
