@@ -48,7 +48,7 @@ class EnvParams(environment.EnvParams):
     distances: Integer[Array, "nodes nodes"] = field(
         default_factory=lambda: jnp.zeros((1, 1))
     )
-    n_cars: int = 1
+    n_cars: int = struct.field(pytree_node=False, default=1)
 
     @property
     def n_nodes(self) -> int:
@@ -358,7 +358,7 @@ def load_manhattan_data():
         f"{root}/manhattan-trips.parquet",
         known_hash="md5:653f0d7d28348a3e998fdb38ef00ef47",
     )
-    raw_events = pd.read_parquet(events_fname).head(self.n_events)
+    raw_events = pd.read_parquet(events_fname)
     distance_matrix_fname = pooch.retrieve(
         f"{root}/manhattan-distances.npy",
         known_hash="md5:95fda63cbed95bdb094f3b76baa7c7b4",
@@ -424,7 +424,7 @@ class GreedyPolicy(Policy):
     n_cars: int
     temperature: float
 
-    @partial(jax.jit, static_argnums=(0,))
+    @jax.jit
     def apply(
         self,
         env_params: EnvParams,
