@@ -286,6 +286,12 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         )
         done = self.is_terminal(next_state, params)
         reward = 0.0
+        utilization = (
+            jnp.sum(state.times > state.event.t)
+            / _num_wp(params.max_active_trips)
+            / params.n_cars
+        )
+        pct_cars_on_trip = jnp.any(state.times > state.event.t, axis=1).mean()
 
         return (
             lax.stop_gradient(self.get_obs(next_state)),
@@ -297,6 +303,9 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
                 "is_unfulfill": True,
                 # "is_match": False,
                 "marginal_cost": 0,
+                "utilization": utilization,
+                "pct_cars_on_trip": pct_cars_on_trip,
+                "t": state.event.t
             },
         )
 
@@ -335,6 +344,14 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         done = self.is_terminal(next_state, params)
         trip_direct_cost = params.distances[state.event.src, state.event.dest]
         reward = trip_direct_cost * (1 + params.profit_margin) - marginal_cost
+        utilization = (
+            jnp.sum(state.times > state.event.t)
+            / _num_wp(params.max_active_trips)
+            / params.n_cars
+        )
+
+        pct_cars_on_trip = jnp.any(state.times > state.event.t, axis=1).mean()
+
         results = (
             lax.stop_gradient(self.get_obs(next_state)),
             lax.stop_gradient(next_state),
@@ -343,8 +360,10 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             {
                 "discount": self.discount(state, params),
                 "is_unfulfill": False,
-                # "is"
                 "marginal_cost": marginal_cost,
+                "utilization": utilization,
+                "pct_cars_on_trip": pct_cars_on_trip,
+                "t": state.event.t
             },
         )
 
@@ -460,7 +479,7 @@ class GreedyPolicy(rs.GreedyPolicy):
         rng: chex.PRNGKey,
     ):
         event, waypoints, times = obs_to_state(
-            self.n_cars, env_params.max_active_trips * 2, obs
+            self.n_cars, _num_wp(env_params.max_active_trips), obs
         )
         rng, cost_rng = jax.random.split(rng)
         costs, is_feasible = self.get_costs(
