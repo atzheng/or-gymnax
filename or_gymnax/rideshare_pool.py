@@ -128,9 +128,15 @@ def insert_and_optimize_trip(
         lambda: time,
     )
 
+    current_marginal_cost = jax.lax.cond(
+        jnp.any(is_active),
+        lambda: jnp.max(times) - next_wp_time,
+        lambda: 0,
+    )
+
     # Figure out where to insert the new trip
     # ------------------------------------------------------
-    new_times, marginal_cost = optimize_waypoints(
+    new_times, new_marginal_cost = optimize_waypoints(
         distances,
         new_waypoints,
         new_times_draft,
@@ -138,16 +144,20 @@ def insert_and_optimize_trip(
         next_wp_time,
         max_active_trips,
     )
-
+    marginal_marginal_cost = new_marginal_cost - current_marginal_cost
     is_feasible = num_active_trips < max_active_trips
-
-    marginal_cost = jax.lax.cond(
-        num_active_trips == max_active_trips,
-        lambda: jnp.iinfo(marginal_cost.dtype).max,
-        lambda: marginal_cost,
+    marginal_cost_or_inf = jax.lax.cond(
+        is_feasible,
+        lambda: marginal_marginal_cost,
+        lambda: jnp.iinfo(new_marginal_cost.dtype).max,
     )
 
-    return new_waypoints, new_times, marginal_cost, is_feasible
+    return (
+        new_waypoints,
+        new_times,
+        marginal_cost_or_inf,
+        is_feasible,
+    )
 
 
 def optimize_waypoints(
@@ -178,6 +188,10 @@ def optimize_waypoints(
 
     # Compute marginal times for each possible waypoint ordering
     # ----------------------------------------------------------------------
+    # NOTE marginal times are not the additional time incurred by adding the
+    # latest waypoint -- These are additional times relative to traveling to the first
+    # waypoint (which cannot be modified)
+
     # All admissible permutations that respect P≺D constraints
     seqs = get_sequences(max_active_trips)  # shape (n_perm, 2·m)
 
@@ -278,7 +292,12 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             lax.stop_gradient(next_state),
             jnp.array(reward, dtype=float),
             done,
-            {"discount": self.discount(state, params)},
+            {
+                "discount": self.discount(state, params),
+                "is_unfulfill": True,
+                # "is_match": False,
+                "marginal_cost": 0,
+            },
         )
 
     def step_env_dispatch(
@@ -288,24 +307,6 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         action: int,
         params: EnvParams,
     ) -> Tuple[chex.Array, EnvState, jnp.ndarray, jnp.ndarray, Dict[Any, Any]]:
-        next_state, marginal_cost = self.dispatch_and_update_state(
-            state, action, params
-        )
-        done = self.is_terminal(next_state, params)
-        trip_direct_cost = params.distances[state.event.src, state.event.dest]
-        reward = trip_direct_cost * (1 + params.profit_margin) - marginal_cost
-
-        return (
-            lax.stop_gradient(self.get_obs(next_state)),
-            lax.stop_gradient(next_state),
-            jnp.array(reward, dtype=float),
-            done,
-            {"discount": self.discount(state, params)},
-        )
-
-    def dispatch_and_update_state(
-        self, state: EnvState, car_id: int, params: EnvParams
-    ) -> Tuple[EnvState, float]:
         (
             new_car_wps,
             new_car_times,
@@ -313,17 +314,16 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             is_feasible,
         ) = insert_and_optimize_trip(
             params.distances,
-            state.waypoints[car_id],
-            state.times[car_id],
+            state.waypoints[action],
+            state.times[action],
             state.event.src,
             state.event.dest,
             state.event.t,
             params.max_active_trips,
         )
         # checkify.check(is_feasible, "Trip being inserted should be feasible for car")
-        new_waypoints = state.waypoints.at[car_id].set(new_car_wps)
-        new_times = state.times.at[car_id].set(new_car_times)
-
+        new_waypoints = state.waypoints.at[action].set(new_car_wps)
+        new_times = state.times.at[action].set(new_car_times)
         next_event = rs.get_nth_event(params.events, state.time + 1)
         next_state = EnvState(
             time=state.time + 1,
@@ -332,8 +332,27 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             key=state.key,
             event=next_event,
         )
+        done = self.is_terminal(next_state, params)
+        trip_direct_cost = params.distances[state.event.src, state.event.dest]
+        reward = trip_direct_cost * (1 + params.profit_margin) - marginal_cost
+        results = (
+            lax.stop_gradient(self.get_obs(next_state)),
+            lax.stop_gradient(next_state),
+            jnp.array(reward, dtype=float),
+            done,
+            {
+                "discount": self.discount(state, params),
+                "is_unfulfill": False,
+                # "is"
+                "marginal_cost": marginal_cost,
+            },
+        )
 
-        return next_state, marginal_cost
+        return jax.lax.cond(
+            is_feasible,
+            lambda: results,
+            lambda: self.step_env_unfulfill(key, state, action, params),
+        )
 
     def reset_env(
         self, key: chex.PRNGKey, params: EnvParams
@@ -385,7 +404,7 @@ class ManhattanRidesharePoolDispatch(RidesharePoolDispatch):
             events=jax.tree.map(lambda x: x[: self.n_events], events),
             distances=distances,
             n_cars=self.n_cars,
-            max_active_trips=2,
+            max_active_trips=3,
         )
 
 
@@ -454,10 +473,12 @@ class GreedyPolicy(rs.GreedyPolicy):
         best_action = jax.random.choice(
             rng,
             jnp.arange(self.n_cars),
-            p=jax.nn.softmax((rewards - jnp.max(rewards)) / self.temperature),
+            p=jax.nn.softmax(
+                (rewards - jnp.max(rewards)) / self.temperature,
+                where=is_feasible,
+            ),
         )
 
-        assert rewards.dtype == jnp.int32, "Rewards should be int32"
         action = jax.lax.cond(
             jnp.any(is_feasible),
             lambda: best_action,
