@@ -1,7 +1,7 @@
 import jax
 from jax.experimental import sparse
 from functools import partial
-from picard.environments.rideshare_dispatch import (
+from or_gymnax.rideshare import (
     ManhattanRideshareDispatch,
     ManhattanRidesharePricing,
     GreedyPolicy,
