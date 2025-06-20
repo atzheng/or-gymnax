@@ -26,6 +26,37 @@ def _num_wp(max_active_trips: int) -> int:
     return max_active_trips * 2  # P,D for every trip
 
 
+def num_active_trips(
+    waypoints: Integer[Array, "n_cars max_waypoints"],
+    times: Integer[Array, "n_cars max_waypoints"],
+    current_time: int,
+) -> Integer[Array, "n_cars"]:
+    """
+    Count number of active trips for each car.
+    
+    Args:
+        waypoints: Waypoint locations for each car
+        times: Completion times for each waypoint
+        current_time: Current simulation time
+    
+    Returns:
+        Array of shape (n_cars,) containing number of active trips per car
+    """
+    # A waypoint is active if its completion time is in the future
+    is_active = times > current_time
+    
+    # Reshape to (n_cars, max_active_trips, 2) to group P,D pairs
+    n_cars, max_waypoints = waypoints.shape
+    max_active_trips = max_waypoints // 2
+    is_active_reshaped = is_active.reshape(n_cars, max_active_trips, 2)
+    
+    # A trip is active if either P or D is active
+    trip_is_active = jnp.any(is_active_reshaped, axis=2)
+    
+    # Sum active trips per car
+    return jnp.sum(trip_is_active, axis=1)
+
+
 def admissible_sequences(max_active_trips: int) -> jnp.ndarray:
     """
     All permutations that satisfy P_i ≺ D_i for every trip i.
@@ -408,8 +439,9 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
 
 
 class ManhattanRidesharePoolDispatch(RidesharePoolDispatch):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs, n_nodes=4333)
+    def __init__(self, n_cars=10000, n_events=100000, uniformize=False):
+        super().__init__(n_cars=n_cars, n_nodes=4333, n_events=n_events)
+        self.uniformize = uniformize
 
     @property
     def name(self) -> str:
@@ -418,7 +450,7 @@ class ManhattanRidesharePoolDispatch(RidesharePoolDispatch):
 
     @property
     def default_params(self) -> EnvParams:
-        events, distances = rs.load_manhattan_data()
+        events, distances = rs.load_manhattan_data(uniformize=self.uniformize)
         return EnvParams(
             events=jax.tree.map(lambda x: x[: self.n_events], events),
             distances=distances,

@@ -352,13 +352,22 @@ class RidesharePricing(RideshareDispatch):
         return super().reset_env(key, params.dispatch_env_params)
 
 
-def load_manhattan_data():
+def load_manhattan_data(uniformize=False):
     root = "https://github.com/atzheng/nyc-taxi-simulator-data/releases/download/initial-release"
     events_fname = pooch.retrieve(
         f"{root}/manhattan-trips.parquet",
         known_hash="md5:653f0d7d28348a3e998fdb38ef00ef47",
     )
     raw_events = pd.read_parquet(events_fname).sort_values("t")
+    raw_events["interarrival_t"] = raw_events["t"].diff().fillna(0).astype(int)
+
+    if uniformize:
+        raw_events["order"] = np.random.permutation(len(raw_events))
+        raw_events.sort_values("order", inplace=True)
+
+    # start_idx = np.random.randint(0, len(raw_events) - n_events + 1)
+    # raw_events = raw_events.iloc[start_idx : start_idx + n_events]
+    raw_events["t"] = raw_events["interarrival_t"].cumsum().astype(int)
 
     distance_matrix_fname = pooch.retrieve(
         f"{root}/manhattan-distances.npy",
@@ -379,8 +388,9 @@ def load_manhattan_data():
 
 
 class ManhattanRideshareDispatch(RideshareDispatch):
-    def __init__(self, n_cars=10000, n_events=100000):
+    def __init__(self, n_cars=10000, n_events=100000, uniformize=False):
         super().__init__(n_cars=n_cars, n_nodes=4333, n_events=n_events)
+        self.uniformize = uniformize
 
     @property
     def name(self) -> str:
@@ -389,13 +399,14 @@ class ManhattanRideshareDispatch(RideshareDispatch):
 
     @property
     def default_params(self) -> EnvParams:
-        events, distances = load_manhattan_data()
+        events, distances = load_manhattan_data(uniformize=self.uniformize)
         return EnvParams(events=events, distances=distances, n_cars=self.n_cars)
 
 
 class ManhattanRidesharePricing(RidesharePricing):
-    def __init__(self, n_cars=10000, n_events=100000):
+    def __init__(self, n_cars=10000, n_events=100000, uniformize=False):
         super().__init__(n_cars=n_cars, n_nodes=4333, n_events=n_events)
+        self.uniformize = uniformize
 
     @property
     def name(self) -> str:
@@ -404,10 +415,12 @@ class ManhattanRidesharePricing(RidesharePricing):
 
     @property
     def default_params(self) -> PricingEnvParams:
-        events, distances = load_manhattan_data()
+        events, distances = load_manhattan_data(uniformize=self.uniformize)
         return PricingEnvParams(
             dispatch_env_params=EnvParams(
-                events=events, distances=distances, n_cars=self.n_cars
+                events=jax.tree.map(lambda x: x[:self.n_events], events),
+                distances=distances,
+                n_cars=self.n_cars,
             ),
             w_price=-1.0,
             w_intercept=1.0,
