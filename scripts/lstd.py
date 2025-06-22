@@ -6,6 +6,9 @@ from jaxtyping import Float, Integer, Bool
 from typing import Tuple, Callable, Optional
 
 
+# Base LSTD
+# -------------------------------------------------------------------------
+
 @struct.dataclass
 class LSTDEstimatorState:
     """
@@ -79,6 +82,8 @@ def lstd(
     # return beta
 
 
+# DQ LSTD
+# -------------------------------------------------------------------------
 @struct.dataclass
 class DQLSTDEstimatorState:
     lstd_tr: LSTDEstimatorState
@@ -169,3 +174,61 @@ def dqlstd(est: DQLSTDEstimatorState) -> Float[Array, "1"]:
     ) / est.lstd_co.count
 
     return (Q_tr - Q_co)[0]  # Difference between treatment and control
+
+# OPE LSTD
+# -------------------------------------------------------------------------
+@struct.dataclass
+class OPELSTDEstimatorState:
+    lstd_tr: LSTDEstimatorState
+    lstd_co: LSTDEstimatorState
+    prev_z: Bool[Array, "1"]
+    prev_r: Float[Array, "1"]
+    prev_phi: Float[Array, "d"]
+
+    @classmethod
+    def init(cls, d: int, phi, r):
+        """
+        Initialize the OPELSTD estimator state.
+
+        Args:
+            d: Dimension of the feature vector
+        """
+        return cls(
+            lstd_tr=LSTDEstimatorState.init(d, phi, r),
+            lstd_co=LSTDEstimatorState.init(d, phi, r),
+            prev_z=jnp.array(False, dtype=jnp.bool_),
+            prev_r=jnp.array(0.0, dtype=jnp.float32),
+            prev_phi=jnp.zeros(d, dtype=jnp.float32),
+        )
+
+
+def opelstd_update(
+    obs_to_repr: Callable[[Float[Array, "d_obs"]], Float[Array, "d"]],
+    est: OPELSTDEstimatorState,
+    reward: Float[Array, "1"],
+    obs: Float[Array, "d_obs"],
+    z: Bool,
+):
+    phi = obs_to_repr(obs)
+
+    new_lstd_tr = lstd_update(
+        est.lstd_tr.replace(phi=est.prev_phi, r=est.prev_r), phi, reward
+    )
+
+    new_lstd_co = lstd_update(
+        est.lstd_co.replace(phi=est.prev_phi, r=est.prev_r), phi, reward
+    )
+
+    return OPELSTDEstimatorState(
+        lstd_tr=jax.lax.cond(est.prev_z, lambda: new_lstd_tr, lambda: est.lstd_tr),
+        lstd_co=jax.lax.cond(~est.prev_z, lambda: new_lstd_co, lambda: est.lstd_co),
+        prev_z=z,
+        prev_r=reward,
+        prev_phi=phi,
+    )
+
+
+def opelstd(est: OPELSTDEstimatorState) -> Float[Array, "1"]:
+    _, rho_tr = lstd(est.lstd_tr)
+    _, rho_co = lstd(est.lstd_co)
+    return rho_tr - rho_co

@@ -361,6 +361,10 @@ def load_manhattan_data(uniformize=False):
     )
     raw_events = pd.read_parquet(events_fname).sort_values("t")
     raw_events["interarrival_t"] = raw_events["t"].diff().fillna(0).astype(int)
+    # Cap interarrival times to 20 minutes; this only affects ~1e-7 prop. of events
+    raw_events["interarrival_t"] = (
+        np.minimum(raw_events["interarrival_t"], 20 * 60 * 60)
+    )
 
     if uniformize:
         raw_events["order"] = np.random.permutation(len(raw_events))

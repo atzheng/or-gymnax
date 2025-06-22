@@ -26,12 +26,12 @@ import jax
 import pooch
 from jax.tree_util import Partial
 from lstd import (
-    LSTDEstimatorState,
-    lstd_update,
-    lstd,
     DQLSTDEstimatorState,
     dqlstd_update,
     dqlstd,
+    opelstd,
+    opelstd_update,
+    OPELSTDEstimatorState,
 )
 from mc import (
     DQMCEstimatorState,
@@ -93,64 +93,6 @@ def naive(est: NaiveEstimatorState):
     avg_rewards = est.rewards / (est.counts + 1e-8)  # Avoid division by zero
     return avg_rewards[1] - avg_rewards[0]
 
-
-@struct.dataclass
-class OPELSTDEstimatorState:
-    lstd_tr: LSTDEstimatorState
-    lstd_co: LSTDEstimatorState
-    prev_z: Bool[Array, "1"]
-    prev_r: Float[Array, "1"]
-    prev_phi: Float[Array, "d"]
-
-    @classmethod
-    def init(cls, d: int):
-        """
-        Initialize the OPELSTD estimator state.
-
-        Args:
-            d: Dimension of the feature vector
-        """
-        return cls(
-            lstd_tr=LSTDEstimatorState.init(d),
-            lstd_co=LSTDEstimatorState.init(d),
-            prev_z=jnp.array(False, dtype=jnp.bool_),
-            prev_r=jnp.array(0.0, dtype=jnp.float32),
-            prev_phi=jnp.zeros(d, dtype=jnp.float32),
-        )
-
-
-def ope_update(
-    obs_to_repr: Callable[[Float[Array, "d_obs"]], Float[Array, "d"]],
-    est: OPELSTDEstimatorState,
-    reward: Float[Array, "1"],
-    obs: Float[Array, "d_obs"],
-    z: Bool,
-):
-    phi = obs_to_repr(obs)
-
-    new_lstd_tr = lstd_update(
-        est.lstd_tr.replace(phi=est.prev_phi, r=est.prev_r), phi, reward
-    )
-
-    new_lstd_co = lstd_update(
-        est.lstd_co.replace(phi=est.prev_phi, r=est.prev_r), phi, reward
-    )
-
-    return OPELSTDEstimatorState(
-        lstd_tr=jax.lax.cond(z, lambda: new_lstd_tr, lambda: est.lstd_tr),
-        lstd_co=jax.lax.cond(~z, lambda: new_lstd_co, lambda: est.lstd_co),
-        prev_z=z,
-        prev_r=reward,
-        prev_phi=phi,
-    )
-
-
-def ope(est: OPELSTDEstimatorState) -> Float[Array, "1"]:
-    _, rho_tr = lstd(est.lstd_tr)
-    _, rho_co = lstd(est.lstd_co)
-    return rho_tr - rho_co
-
-
 @f.partial(jax.jit, static_argnames=("n_cars", "max_waypoints", "n_zones"))
 def obs_to_repr(
     obs: Integer[Array, "o_dim"],
@@ -210,6 +152,7 @@ def obs_to_repr(
 estimator_fns = {
     "naive": naive,
     "dqlstd": dqlstd,
+    "opelstd": opelstd,
     "dqmc-100": dqmc,
     "dqmc-300": dqmc,
 }
@@ -271,8 +214,9 @@ def init_estimator_states(phi, r, z, p):
     return {
         "naive": NaiveEstimatorState.init(),
         "dqlstd": DQLSTDEstimatorState.init(d, phi, r, z, p),
-        "dqmc-100": DQMCEstimatorState.init(100),
-        "dqmc-300": DQMCEstimatorState.init(300),
+        "opelstd": OPELSTDEstimatorState.init(d, phi, r),
+        "dqmc-1000": DQMCEstimatorState.init(1000),
+        "dqmc-3000": DQMCEstimatorState.init(3000),
     }
 
 
@@ -313,6 +257,7 @@ def run_trials(
     estimators = {
         "naive": naive_update,
         "dqlstd": Partial(dqlstd_update, obs_to_repr_fn, p),
+        "opelstd": Partial(opelstd_update, obs_to_repr_fn),
         "dqmc-100": Partial(dqmc_update, p),
         "dqmc-300": Partial(dqmc_update, p),
     }
@@ -413,12 +358,12 @@ def main(
 
     A = GreedyPolicy(
         n_cars=env.n_cars,
-        temperature=0.0,
+        temperature=0.01,
         savings_threshold=savings_threshold_A,
     )
     B = GreedyPolicy(
         n_cars=env.n_cars,
-        temperature=0.0,
+        temperature=0.01,
         savings_threshold=savings_threshold_B,
     )
     print(
