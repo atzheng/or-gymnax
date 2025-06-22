@@ -7,7 +7,7 @@ license = "MIT"
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.11"
+python = "^3.10"
 jax = "^0.5.1"
 flax = "^0.10.4"
 chex = "^0.1.89"

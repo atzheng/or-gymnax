@@ -45,8 +45,9 @@ class EnvParams(environment.EnvParams):
     events: RideshareEvent = RideshareEvent(
         jnp.zeros(1), jnp.zeros(1), jnp.zeros(1)
     )
-    distances: Integer[Array, "nodes nodes"] = field(
-        default_factory=lambda: jnp.zeros((1, 1))
+    distances: Integer[Array, "nodes nodes"] = struct.field(
+        default_factory=lambda: jnp.zeros((1, 1)),
+        pytree_node=False,
     )
     n_cars: int = struct.field(pytree_node=False, default=1)
 

@@ -439,8 +439,8 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
 
 
 class ManhattanRidesharePoolDispatch(RidesharePoolDispatch):
-    def __init__(self, n_cars=10000, n_events=100000, uniformize=False):
-        super().__init__(n_cars=n_cars, n_nodes=4333, n_events=n_events)
+    def __init__(self, *args, uniformize=False, **kwargs):
+        super().__init__(*args, **kwargs, n_nodes=4333)
         self.uniformize = uniformize
 
     @property
