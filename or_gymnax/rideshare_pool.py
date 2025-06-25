@@ -13,7 +13,7 @@ from jax import lax
 import jax.numpy as jnp
 from gymnax.environments import environment
 from jaxtyping import Float, Integer, Bool
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Union, Optional
 import itertools as it
 from jax.experimental import checkify
 
@@ -33,26 +33,26 @@ def num_active_trips(
 ) -> Integer[Array, "n_cars"]:
     """
     Count number of active trips for each car.
-    
+
     Args:
         waypoints: Waypoint locations for each car
         times: Completion times for each waypoint
         current_time: Current simulation time
-    
+
     Returns:
         Array of shape (n_cars,) containing number of active trips per car
     """
     # A waypoint is active if its completion time is in the future
     is_active = times > current_time
-    
+
     # Reshape to (n_cars, max_active_trips, 2) to group P,D pairs
     n_cars, max_waypoints = waypoints.shape
     max_active_trips = max_waypoints // 2
     is_active_reshaped = is_active.reshape(n_cars, max_active_trips, 2)
-    
+
     # A trip is active if either P or D is active
     trip_is_active = jnp.any(is_active_reshaped, axis=2)
-    
+
     # Sum active trips per car
     return jnp.sum(trip_is_active, axis=1)
 
@@ -142,7 +142,7 @@ def insert_and_optimize_trip(
         .set(jnp.iinfo(times.dtype).max)
         .at[first_inactive_trip * 2 + 1]
         .set(jnp.iinfo(times.dtype).max)
-    )  # Todo make this maxint
+    )
 
     is_active = times > time
     next_wp_idx = jax.lax.cond(
@@ -307,7 +307,8 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         action: int,
         params: EnvParams,
     ) -> Tuple[chex.Array, EnvState, jnp.ndarray, jnp.ndarray, Dict[Any, Any]]:
-        next_event = rs.get_nth_event(params.events, state.time + 1)
+        key, event_key = jax.random.split(state.key)
+        next_event = rs.get_random_event(event_key, params.events, state.event.t)
         next_state = EnvState(
             time=state.time + 1,
             waypoints=state.waypoints,
@@ -336,7 +337,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
                 "marginal_cost": 0,
                 "utilization": utilization,
                 "pct_cars_on_trip": pct_cars_on_trip,
-                "t": state.event.t
+                "t": state.event.t,
             },
         )
 
@@ -364,7 +365,8 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         # checkify.check(is_feasible, "Trip being inserted should be feasible for car")
         new_waypoints = state.waypoints.at[action].set(new_car_wps)
         new_times = state.times.at[action].set(new_car_times)
-        next_event = rs.get_nth_event(params.events, state.time + 1)
+        key, event_key = jax.random.split(key)
+        next_event = rs.get_random_event(event_key, params.events, state.event.t)
         next_state = EnvState(
             time=state.time + 1,
             waypoints=new_waypoints,
@@ -394,7 +396,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
                 "marginal_cost": marginal_cost,
                 "utilization": utilization,
                 "pct_cars_on_trip": pct_cars_on_trip,
-                "t": state.event.t
+                "t": state.event.t,
             },
         )
 
@@ -421,7 +423,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
                 (self.n_cars, _num_wp(params.max_active_trips)), dtype=int
             ),
             key=key,
-            event=rs.get_nth_event(params.events, 0),
+            event=rs.get_random_event(key_reset, params.events, 0),
         )
         return self.get_obs(state), state
 
@@ -466,7 +468,7 @@ class GreedyPolicy(rs.GreedyPolicy):
     marginal cost for pooled rides, accounting for existing waypoints.
     """
 
-    savings_threshold: float = 0.0
+    savings_threshold: Union[float, Float[Array, "n_cars"]] = 0.0
 
     def get_costs(
         self,
@@ -495,12 +497,15 @@ class GreedyPolicy(rs.GreedyPolicy):
         maxint = jnp.iinfo(costs.dtype).max
         min_solo_cost = jnp.min(jnp.where(is_solo, costs, maxint))
         min_pool_cost = jnp.min(jnp.where(~is_solo, costs, maxint))
-        # Only use pool if it saves savings_threshold % of the cost relative to solo
-        thresholded_costs = jax.lax.cond(
-            min_pool_cost < min_solo_cost * (1 - self.savings_threshold),
-            lambda: costs,
-            lambda: jnp.where(is_solo, costs, maxint),
+
+        # Check for eligibility based on savings threshold
+        is_eligible = jnp.logical_or(
+            is_solo,  # Solo trips are always eligible
+            costs < min_solo_cost * (1 - self.savings_threshold),
         )
+
+        # Only use pool if it saves savings_threshold % of the cost relative to solo
+        thresholded_costs = jnp.where(is_eligible, costs, maxint)
         return thresholded_costs, is_feasible
 
     def apply(

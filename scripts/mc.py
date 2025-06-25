@@ -85,5 +85,5 @@ def dqmc(est: DQMCEstimatorState):
     r0bar = est.sum_r0 / est.count
     Q0 = est.sum_Q0 - est.sum_ipw0 * r0bar * (window_size - 1)
     rdiff_bar = (est.sum_r1 - est.sum_r0) / est.count
-    Qdiff = est.sum_Qdiff - rdiff_bar * (window_size - 1)
+    Qdiff = est.sum_Qdiff - est.count * rdiff_bar * (window_size - 1)
     return (Q1 - Q0 - Qdiff)[0] / (est.count - window_size)  # Average treatment effect

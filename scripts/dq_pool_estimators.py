@@ -29,14 +29,22 @@ from lstd import (
     DQLSTDEstimatorState,
     dqlstd_update,
     dqlstd,
+    DQLSTDPGEstimatorState,
+    dqlstdpg_update,
+    dqlstdpg,
     opelstd,
     opelstd_update,
     OPELSTDEstimatorState,
 )
-from mc import (
+from mc_v2 import (
     DQMCEstimatorState,
     dqmc_update,
     dqmc,
+)
+from diffgq1 import (
+    OPEDiffGQ1EstimatorState,
+    opediffgq1_update,
+    opediffgq1,
 )
 
 ex = Experiment("rideshares")
@@ -93,6 +101,72 @@ def naive(est: NaiveEstimatorState):
     avg_rewards = est.rewards / (est.counts + 1e-8)  # Avoid division by zero
     return avg_rewards[1] - avg_rewards[0]
 
+
+@f.partial(jax.jit, static_argnames=("n_cars", "max_waypoints", "n_zones"))
+# def obs_to_repr(
+#     obs: Integer[Array, "o_dim"],
+#     n_cars: int,
+#     max_waypoints: int,
+#     n_zones: int,
+#     nodes_to_zones: Integer[Array, "n_nodes"],
+# ) -> Float[Array, "repr_dim"]:
+#     """
+#     Convert observation to state representation counting cars by location and active trips.
+
+#     Args:
+#         obs: Raw observation from environment
+#         n_cars: Number of cars in system
+#         max_waypoints: Maximum number of waypoints per car
+#         n_zones: Number of spatial zones (clusters) in the environment
+#         nodes_zones: DataFrame mapping node IDs to zone IDs
+
+#     Returns:
+#         Array of shape (3 * n_zones, ) containing counts of cars in each
+#         zone with 0, 1, or 2 active trips respectively
+#     """
+#     # Get waypoints and times from observation
+#     _, waypoints, times = obs_to_state(n_cars, max_waypoints, obs)
+
+#     # Get current time
+#     current_time = obs[0]
+
+#     # Count active trips per car
+#     active_trips = rsp.num_active_trips(waypoints, times, current_time)
+
+#     final_wp_idx = jnp.argmax(times, axis=1)
+
+#     is_active = times > current_time
+#     is_solo = jnp.all(~is_active, axis=1)
+
+#     next_wp_idx = jnp.argmin(
+#         jnp.where(times >= current_time, times, jnp.inf), axis=1
+#     )
+
+#     next_locations = jnp.take_along_axis(
+#         waypoints, jnp.expand_dims(next_wp_idx, 1), axis=1
+#     ).squeeze()
+
+#     final_locations = jnp.take_along_axis(
+#         waypoints, jnp.expand_dims(final_wp_idx, 1), axis=1
+#     ).squeeze()
+
+#     next_zones = nodes_to_zones[next_locations]
+#     final_zones = nodes_to_zones[final_locations]
+
+#     pool_repr = (
+#         jnp.zeros((n_zones, n_zones))
+#         .at[next_zones, final_zones]
+#         .add(
+#             ~is_solo * (max_waypoints // 2 - active_trips)
+#         )  # Remaining seats, solo dealt with separately
+#         .reshape(-1)
+#     )
+
+#     solo_repr = jnp.zeros((n_zones,)).at[final_zones].add(is_solo)
+
+#     # Intercept
+#     return jnp.sqrt(jnp.concatenate((pool_repr, solo_repr)))
+
 @f.partial(jax.jit, static_argnames=("n_cars", "max_waypoints", "n_zones"))
 def obs_to_repr(
     obs: Integer[Array, "o_dim"],
@@ -123,39 +197,9 @@ def obs_to_repr(
 
     # Count active trips per car
     active_trips = rsp.num_active_trips(waypoints, times, current_time)
+    repr = jnp.zeros((4, ), dtype=jnp.float32).at[active_trips].add(1)
+    return repr
 
-    is_active = times > current_time
-    next_wp_idx = jnp.where(
-        jnp.any(is_active, axis=1),  # If any waypoints are active...
-        # ...find the next waypoint
-        jnp.argmin(jnp.where(times >= current_time, times, jnp.inf), axis=1),
-        # ...else, return the last completed waypoint
-        jnp.argmax(times, axis=1),
-    )
-
-    next_locations = jnp.take_along_axis(
-        waypoints, jnp.expand_dims(next_wp_idx, 1), axis=1
-    ).squeeze()
-
-    # Convert node IDs to zone IDs
-    zone_ids = nodes_to_zones[next_locations]
-    zones_and_active_trips_idx = active_trips * n_zones + zone_ids
-
-    repr = jnp.zeros(3 * n_zones).at[zones_and_active_trips_idx].add(1)
-    # Add log features
-    repr_aug = jnp.concatenate((repr, jnp.log(repr + 1)))
-
-    # Intercept
-    return repr_aug
-
-
-estimator_fns = {
-    "naive": naive,
-    "dqlstd": dqlstd,
-    "opelstd": opelstd,
-    "dqmc-100": dqmc,
-    "dqmc-300": dqmc,
-}
 
 def collect_step(
     env,
@@ -214,10 +258,43 @@ def init_estimator_states(phi, r, z, p):
     return {
         "naive": NaiveEstimatorState.init(),
         "dqlstd": DQLSTDEstimatorState.init(d, phi, r, z, p),
+        "dqlstdpg": DQLSTDPGEstimatorState.init(d, phi, r, z, p),
         "opelstd": OPELSTDEstimatorState.init(d, phi, r),
-        "dqmc-1000": DQMCEstimatorState.init(1000),
-        "dqmc-3000": DQMCEstimatorState.init(3000),
+        "opediffgq1": OPEDiffGQ1EstimatorState.init(d, phi, r),
+        "dqmc-100": DQMCEstimatorState.init(100),
+        "dqmc-100-99": DQMCEstimatorState.init(100),
+        "dqmc-100-999": DQMCEstimatorState.init(100),
+        "dqmc-100-995": DQMCEstimatorState.init(100),
+        "dqmc-300": DQMCEstimatorState.init(300),
+        "dqmc-300-99": DQMCEstimatorState.init(300),
+        "dqmc-300-999": DQMCEstimatorState.init(300),
+        "dqmc-300-995": DQMCEstimatorState.init(300),
+        "dqmc-1000-20": DQMCEstimatorState.init(1000),
+        "dqmc-3000-20": DQMCEstimatorState.init(3000),
+        "dqmc-1000-30": DQMCEstimatorState.init(1000),
+        "dqmc-3000-30": DQMCEstimatorState.init(3000),
     }
+
+
+estimator_fns = {
+    "naive": naive,
+    "dqlstd": dqlstd,
+    "dqlstdpg": dqlstdpg,
+    "opelstd": opelstd,
+    "opediffgq1": opediffgq1,
+    "dqmc-100": dqmc,
+    "dqmc-100-99": dqmc,
+    "dqmc-100-999": dqmc,
+    "dqmc-100-995": dqmc,
+    "dqmc-300": dqmc,
+    "dqmc-300-99": dqmc,
+    "dqmc-300-999": dqmc,
+    "dqmc-300-995": dqmc,
+    "dqmc-1000-20": dqmc,
+    "dqmc-3000-20": dqmc,
+    "dqmc-1000-30": dqmc,
+    "dqmc-3000-30": dqmc,
+}
 
 
 @f.partial(
@@ -258,8 +335,30 @@ def run_trials(
         "naive": naive_update,
         "dqlstd": Partial(dqlstd_update, obs_to_repr_fn, p),
         "opelstd": Partial(opelstd_update, obs_to_repr_fn),
-        "dqmc-100": Partial(dqmc_update, p),
-        "dqmc-300": Partial(dqmc_update, p),
+        "opediffgq1": Partial(
+            opediffgq1_update, obs_to_repr_fn, 0.001, eta=0.01
+        ),
+        "dqmc-100": Partial(dqmc_update, env_params.distances, p),
+        "dqmc-100-99": Partial(dqmc_update, env_params.distances, p, gamma=0.99),
+        "dqmc-100-999": Partial(dqmc_update, env_params.distances, p, gamma=0.999),
+        "dqmc-100-995": Partial(dqmc_update, env_params.distances, p, gamma=0.995),
+        "dqmc-300": Partial(dqmc_update, env_params.distances, p),
+        "dqmc-300-99": Partial(dqmc_update, env_params.distances, p, gamma=0.99),
+        "dqmc-300-999": Partial(dqmc_update, env_params.distances, p, gamma=0.999),
+        "dqmc-300-995": Partial(dqmc_update, env_params.distances, p, gamma=0.995),
+        "dqmc-1000-30": Partial(
+            dqmc_update, env_params.distances, p, max_distance=30 * 60
+        ),
+        "dqmc-1000-20": Partial(
+            dqmc_update, env_params.distances, p, max_distance=20 * 60
+        ),
+        "dqmc-3000-30": Partial(
+            dqmc_update, env_params.distances, p, max_distance=30 * 60
+        ),
+        "dqmc-3000-20": Partial(
+            dqmc_update, env_params.distances, p, max_distance=20 * 60
+        ),
+        "dqlstdpg": Partial(dqlstdpg_update, obs_to_repr_fn, p),
     }
 
     def scanner(carry):
@@ -303,33 +402,48 @@ def run_trials(
     init_carry = (obs1, state1, init_ests, step_keys)
     vmap_scan = jax.vmap(scanner, in_axes=(0,))
     estimator_results = vmap_scan(init_carry)
-
-    return {
+    results = {
         est_name: jax.vmap(est, in_axes=(0,))(estimator_results[est_name])
         for est_name, est in estimator_fns.items()
     }
+    for lam2 in range(12):
+        lam = lam2 / 2
+        for gam in [1.0, 0.999, 0.995, 0.99]:
+            results[f"dqlstd-lam=1e{lam}-gam={gam}"] = jax.vmap(
+                dqlstd, in_axes=(0, None, None)
+            )(estimator_results["dqlstd"], 10**lam, gam)
+            results[f"opelstd-lam=1e{lam}-gam={gam}"] = jax.vmap(
+                opelstd, in_axes=(0, None, None)
+            )(estimator_results["opelstd"], 10**lam, gam)
+
+    return results
 
 
 def load_taxi_zones():
     zones = pd.read_parquet("taxi-zones.parquet")
-    # TODO not sure if nodes are correctly mapped
-    unq_zones, unq_zone_ids = np.unique(zones["zone"], return_inverse=True)
-    zones["zone_id"] = unq_zone_ids
-    max_zone_id = zones["zone_id"].max()
+    neighborhoods = pd.read_csv("neighborhoods.csv")
+    ids = pd.DataFrame({"neighborhood": neighborhoods["neighborhood"].unique()})
+    ids["neighborhood_id"] = ids.index
+
+    max_id = ids["neighborhood_id"].max()
+    zones = pd.merge(zones, neighborhoods, on="zone", how="left").merge(
+        ids, on="neighborhood", how="left"
+    )
     nodes_fname = pooch.retrieve(
         "https://github.com/atzheng/nyc-taxi-simulator-data/releases/download/initial-release/manhattan-nodes.parquet",
         known_hash="md5:4d75202c20f3b7816d45b6e068f684b6",
     )
     nodes = pd.read_parquet(nodes_fname)
+
     nodes["lng"] = nodes["lng"].astype(float)
     nodes["lat"] = nodes["lat"].astype(float)
     nodes_zones = nodes.merge(zones, on="osmid")
 
     # Create a vector mapping nodes to zones
     nodes_to_zones = (
-        (jnp.ones(len(nodes), dtype=jnp.int32) * (max_zone_id + 1))
+        (jnp.ones(len(nodes), dtype=jnp.int32) * (max_id + 1))
         .at[nodes_zones["idx"].values]
-        .set(nodes_zones["zone_id"].values)
+        .set(nodes_zones["neighborhood_id"].values)
     )
     return nodes_to_zones
 
@@ -376,7 +490,8 @@ def main(
     )
 
     all_results = []
-    keys = jax.random.split(key, k // batch_size + 1)
+    n_batches = int(np.ceil(k / batch_size))
+    keys = jax.random.split(key, n_batches)
 
     for key in tqdm(keys):
         ests = run_trials(

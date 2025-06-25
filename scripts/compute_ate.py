@@ -16,7 +16,7 @@ ex = Experiment("compute-ate")
 def config():
     n_cars = 300  # Number of cars
     # Pricing choice model parameters
-    max_active_trips = 2
+    max_active_trips = 3
     n_events = 10000  # Number of events to simulate per trial
     batch_size = 100  # Number of environments to run in parallel
     k = 100  # Total number of trials
@@ -75,7 +75,9 @@ def main(
     savings_threshold_A,
     savings_threshold_B,
 ):
-    env = ManhattanRidesharePoolDispatch(n_cars=n_cars, n_events=n_events)
+    env = ManhattanRidesharePoolDispatch(
+        n_cars=n_cars, n_events=n_events, uniformize=True
+    )
     env_params = env.default_params
     env_params = env_params.replace(max_active_trips=max_active_trips)
 

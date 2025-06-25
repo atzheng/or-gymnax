@@ -1,7 +1,6 @@
 """
 Pricing and dispatch ridesharing environments
 """
-from dataclasses import field
 from functools import partial
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -62,7 +61,9 @@ class EnvParams(environment.EnvParams):
 
 @struct.dataclass
 class PricingEnvParams(environment.EnvParams):
-    dispatch_env_params: EnvParams = field(default_factory=lambda: EnvParams())
+    dispatch_env_params: EnvParams = struct.field(
+        default_factory=lambda: EnvParams()
+    )
     w_price: float = -1.0
     w_eta: float = -1.0
     w_intercept: float = 1.0
@@ -80,8 +81,21 @@ class PricingEnvParams(environment.EnvParams):
         return self.dispatch_env_params.n_cars
 
 
-def get_nth_event(event: RideshareEvent, n: int) -> RideshareEvent:
-    return RideshareEvent(event.t[n], event.src[n], event.dest[n])
+def get_random_event(
+    key: chex.PRNGKey,
+    event: RideshareEvent,
+    current_time: int,
+) -> RideshareEvent:
+    """Get a random event and adjust its time based on interarrival time."""
+    key1, key2 = jax.random.split(key)
+    idx = jax.random.randint(key1, (), 0, event.t.shape[0])
+    # Get interarrival time from the sampled event
+    interarrival = jnp.where(idx > 0, event.t[idx] - event.t[idx-1], event.t[0])
+    return RideshareEvent(
+        current_time + interarrival,
+        event.src[idx],
+        event.dest[idx]
+    )
 
 
 @partial(jax.jit, static_argnums=(0,))
@@ -123,7 +137,8 @@ class RideshareDispatch(environment.Environment[EnvState, EnvParams]):
         action: int,
         params: EnvParams,
     ) -> Tuple[chex.Array, EnvState, jnp.ndarray, jnp.ndarray, Dict[Any, Any]]:
-        next_event = get_nth_event(params.events, state.time + 1)
+        key, event_key = jax.random.split(state.key)
+        next_event = get_random_event(event_key, params.events, state.event.t)
         next_state = EnvState(
             time=state.time + 1,
             locations=state.locations,
@@ -210,7 +225,7 @@ class RideshareDispatch(environment.Environment[EnvState, EnvParams]):
             ),
             times=jnp.zeros(self.n_cars, dtype=int),  # Empty cars
             key=key,
-            event=get_nth_event(params.events, 0),
+            event=get_random_event(key_reset, params.events, 0),
         )
         return self.get_obs(state), state
 
@@ -362,8 +377,8 @@ def load_manhattan_data(uniformize=False):
     raw_events = pd.read_parquet(events_fname).sort_values("t")
     raw_events["interarrival_t"] = raw_events["t"].diff().fillna(0).astype(int)
     # Cap interarrival times to 20 minutes; this only affects ~1e-7 prop. of events
-    raw_events["interarrival_t"] = (
-        np.minimum(raw_events["interarrival_t"], 20 * 60 * 60)
+    raw_events["interarrival_t"] = np.minimum(
+        raw_events["interarrival_t"], 20 * 60 * 60
     )
 
     if uniformize:
@@ -423,7 +438,7 @@ class ManhattanRidesharePricing(RidesharePricing):
         events, distances = load_manhattan_data(uniformize=self.uniformize)
         return PricingEnvParams(
             dispatch_env_params=EnvParams(
-                events=jax.tree.map(lambda x: x[:self.n_events], events),
+                events=jax.tree.map(lambda x: x[: self.n_events], events),
                 distances=distances,
                 n_cars=self.n_cars,
             ),
@@ -440,7 +455,7 @@ class GreedyPolicy(Policy):
     estimated time of arrival (ETA) to the pickup location.
     """
 
-    n_cars: int
+    n_cars: int = struct.field(pytree_node=False)
     temperature: float
 
     @jax.jit
