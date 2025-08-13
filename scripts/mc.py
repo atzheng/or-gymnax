@@ -4,6 +4,7 @@ from flax import struct
 from jax import Array
 from jaxtyping import Float, Integer, Bool
 from typing import Tuple
+from step import StepInfo
 
 
 @struct.dataclass
@@ -39,9 +40,8 @@ def dqmc_update(
     # window_size: int,  # Size of the sliding window
     p: float,  # Probability of treatment
     est: DQMCEstimatorState,
-    r: Float[Array, "1"],  # Reward at time t
-    phi,
-    z: Float[Array, "1"],  # Treatment indicator at time t
+    obs,
+    stepinfo: StepInfo,
     Qbar=0  # Baseline for DR
 ) -> DQMCEstimatorState:
     window_size = est.r.shape[0]  # Use the size of the r array as window size
@@ -66,12 +66,12 @@ def dqmc_update(
 
     return DQMCEstimatorState(
         count=est.count + 1,
-        r=est.r.at[ptr].set(r),
-        z=est.z.at[ptr].set(z),
-        sum_r1=est.sum_r1 + r * z / p,
-        sum_ipw1=est.sum_ipw1 + z / p,
-        sum_r0=est.sum_r1 + r * (1 - z) / (1 - p),
-        sum_ipw0=est.sum_ipw0 + (1 - z) / (1 - p),
+        r=est.r.at[ptr].set(stepinfo.reward),
+        z=est.z.at[ptr].set(stepinfo.is_treat),
+        sum_r1=est.sum_r1 + stepinfo.reward * stepinfo.is_treat / p,
+        sum_ipw1=est.sum_ipw1 + stepinfo.is_treat / p,
+        sum_r0=est.sum_r1 + stepinfo.reward * (1 - stepinfo.is_treat) / (1 - p),
+        sum_ipw0=est.sum_ipw0 + (1 - stepinfo.is_treat) / (1 - p),
         sum_Q1=sum_Q1,
         sum_Q0=sum_Q0,
         sum_Qdiff=sum_Qdiff,

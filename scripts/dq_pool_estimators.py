@@ -46,6 +46,7 @@ from diffgq1 import (
     opediffgq1_update,
     opediffgq1,
 )
+from step import StepInfo
 
 ex = Experiment("rideshares")
 
@@ -60,8 +61,8 @@ def config():
         0.2  # Minimum savings required for pooling in policy B
     )
     n_events = 10000  # Number of events to simulate per trial
-    k = 1000  # Total number of trials
-    batch_size = 100  # Number of environments to run in parallel
+    k = 10  # Total number of trials
+    batch_size = 10  # Number of environments to run in parallel
     p = 0.5  # Treatment probability
     output = "results.csv"
     config_output = "config.csv"
@@ -87,13 +88,12 @@ class NaiveEstimatorState:
 
 def naive_update(
     est: NaiveEstimatorState,
-    reward: float,
     obs: Integer[Array, "o_dim"],
-    z: Bool,
+    stepinfo: StepInfo,
 ):
     return NaiveEstimatorState(
-        est.counts.at[z.astype(jnp.uint8)].add(1),
-        est.rewards.at[z.astype(jnp.uint8)].add(reward),
+        est.counts.at[stepinfo.is_treat.astype(jnp.uint8)].add(1),
+        est.rewards.at[stepinfo.is_treat.astype(jnp.uint8)].add(stepinfo.reward),
     )
 
 
@@ -167,6 +167,7 @@ def naive(est: NaiveEstimatorState):
 #     # Intercept
 #     return jnp.sqrt(jnp.concatenate((pool_repr, solo_repr)))
 
+
 @f.partial(jax.jit, static_argnames=("n_cars", "max_waypoints", "n_zones"))
 def obs_to_repr(
     obs: Integer[Array, "o_dim"],
@@ -197,7 +198,7 @@ def obs_to_repr(
 
     # Count active trips per car
     active_trips = rsp.num_active_trips(waypoints, times, current_time)
-    repr = jnp.zeros((4, ), dtype=jnp.float32).at[active_trips].add(1)
+    repr = jnp.zeros((4,), dtype=jnp.float32).at[active_trips].add(1)
     return repr
 
 
@@ -214,18 +215,20 @@ def collect_step(
     key, policy_key = jax.random.split(key)
     key, treat_key = jax.random.split(key)
     is_treat = jax.random.bernoulli(treat_key, p=p)
+    action_A = A.apply(env_params, dict(), obs, policy_key)
+    action_B = B.apply(env_params, dict(), obs, policy_key)
     action, action_info = jax.lax.cond(
-        is_treat,
-        lambda: B.apply(env_params, dict(), obs, policy_key),
-        lambda: A.apply(env_params, dict(), obs, policy_key),
+        is_treat, lambda: action_B, lambda: action_A
     )
-
     new_obs, new_state, reward, _, _ = env.step(key, state, action, env_params)
 
     return (
-        is_treat,
-        action,
-        reward,
+        StepInfo(
+            is_treat=is_treat,
+            action_A=action_A,
+            action_B=action_B,
+            reward=reward,
+        ),
         new_obs,
         new_state,
     )
@@ -243,11 +246,11 @@ def stepper(
 ):
     obs, state, ests, key = carry
     key, subkey = jax.random.split(key)
-    is_treat, action, reward, new_obs, new_state = collect_step(
-        env, env_params, A, B, obs, state, subkey, p
-    )
+    step_info, new_obs, new_state = collect_step(env, env_params, A, B, obs, state, subkey, p)
     new_ests = {
-        est_name: est_update(ests[est_name], reward, obs, is_treat)
+        est_name: est_update(
+            ests[est_name], obs, step_info
+        )
         for est_name, est_update in estimators.items()
     }
     return ((new_obs, new_state, new_ests, key), None)
@@ -260,7 +263,7 @@ def init_estimator_states(phi, r, z, p):
         "dqlstd": DQLSTDEstimatorState.init(d, phi, r, z, p),
         "dqlstdpg": DQLSTDPGEstimatorState.init(d, phi, r, z, p),
         "opelstd": OPELSTDEstimatorState.init(d, phi, r),
-        "opediffgq1": OPEDiffGQ1EstimatorState.init(d, phi, r),
+        # "opediffgq1": OPEDiffGQ1EstimatorState.init(d, phi, r),
         "dqmc-100": DQMCEstimatorState.init(100),
         "dqmc-100-99": DQMCEstimatorState.init(100),
         "dqmc-100-999": DQMCEstimatorState.init(100),
@@ -281,7 +284,7 @@ estimator_fns = {
     "dqlstd": dqlstd,
     "dqlstdpg": dqlstdpg,
     "opelstd": opelstd,
-    "opediffgq1": opediffgq1,
+    # "opediffgq1": opediffgq1,
     "dqmc-100": dqmc,
     "dqmc-100-99": dqmc,
     "dqmc-100-999": dqmc,
@@ -335,17 +338,29 @@ def run_trials(
         "naive": naive_update,
         "dqlstd": Partial(dqlstd_update, obs_to_repr_fn, p),
         "opelstd": Partial(opelstd_update, obs_to_repr_fn),
-        "opediffgq1": Partial(
-            opediffgq1_update, obs_to_repr_fn, 0.001, eta=0.01
-        ),
+        # "opediffgq1": Partial(
+        #     opediffgq1_update, obs_to_repr_fn, 0.001, eta=0.01
+        # ),
         "dqmc-100": Partial(dqmc_update, env_params.distances, p),
-        "dqmc-100-99": Partial(dqmc_update, env_params.distances, p, gamma=0.99),
-        "dqmc-100-999": Partial(dqmc_update, env_params.distances, p, gamma=0.999),
-        "dqmc-100-995": Partial(dqmc_update, env_params.distances, p, gamma=0.995),
+        "dqmc-100-99": Partial(
+            dqmc_update, env_params.distances, p, gamma=0.99
+        ),
+        "dqmc-100-999": Partial(
+            dqmc_update, env_params.distances, p, gamma=0.999
+        ),
+        "dqmc-100-995": Partial(
+            dqmc_update, env_params.distances, p, gamma=0.995
+        ),
         "dqmc-300": Partial(dqmc_update, env_params.distances, p),
-        "dqmc-300-99": Partial(dqmc_update, env_params.distances, p, gamma=0.99),
-        "dqmc-300-999": Partial(dqmc_update, env_params.distances, p, gamma=0.999),
-        "dqmc-300-995": Partial(dqmc_update, env_params.distances, p, gamma=0.995),
+        "dqmc-300-99": Partial(
+            dqmc_update, env_params.distances, p, gamma=0.99
+        ),
+        "dqmc-300-999": Partial(
+            dqmc_update, env_params.distances, p, gamma=0.999
+        ),
+        "dqmc-300-995": Partial(
+            dqmc_update, env_params.distances, p, gamma=0.995
+        ),
         "dqmc-1000-30": Partial(
             dqmc_update, env_params.distances, p, max_distance=30 * 60
         ),
@@ -384,22 +399,28 @@ def run_trials(
 
     key, init_step_key = jax.random.split(key)
     init_step_keys = jax.random.split(init_step_key, n_envs)
-    is_treat, _, rewards, obs1, state1 = jax.vmap(
+    step_infos_tuple = jax.vmap(
         collect_step, in_axes=(None, None, None, None, 0, 0, 0, None)
     )(env, env_params, A, B, obs0, state0, init_step_keys, p)
+    step_infos, new_obs_batch, new_state_batch = step_infos_tuple
 
     init_ests = jax.vmap(
         init_estimator_states,
         in_axes=(0, 0, 0, None),
     )(
-        jax.vmap(obs_to_repr_fn, in_axes=(0,))(obs1),
-        rewards,
-        is_treat,
+        jax.vmap(obs_to_repr_fn, in_axes=(0,))(new_obs_batch),
+        step_infos.reward,
+        step_infos.is_treat,
         p,
     )
 
     step_keys = jax.random.split(key, n_envs)
-    init_carry = (obs1, state1, init_ests, step_keys)
+    init_carry = (
+        new_obs_batch,
+        new_state_batch,
+        init_ests,
+        step_keys,
+    )
     vmap_scan = jax.vmap(scanner, in_axes=(0,))
     estimator_results = vmap_scan(init_carry)
     results = {

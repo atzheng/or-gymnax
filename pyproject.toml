@@ -16,6 +16,7 @@ gymnax = "^0.0.8"
 pooch = "^1.8.2"
 pandas = "^2.2.3"
 funcy = "^2.0"
+codenamize = "^1.2.3"
 
 
 [build-system]

@@ -5,21 +5,22 @@ from jax.experimental import sparse as jsparse
 import pandas as pd
 from birth_death import BirthDeath
 from flax.struct import dataclass
-from lstd import (
-    DQLSTDEstimatorState,
-    dqlstd_update,
-    dqlstd,
-    OPELSTDEstimatorState,
-    opelstd_update,
-    opelstd,
-)
-from sparse_lstd import (
-    SparseDQLSTDEstimatorState,
-    sparse_dqlstd_update,
-    sparse_dqlstd,
-    SparseOPELSTDEstimatorState,
-    sparse_opelstd_update,
-    sparse_opelstd,
+from step import StepInfo
+# from lstd import (
+#     DQLSTDEstimatorState,
+#     dqlstd_update,
+#     dqlstd,
+#     OPELSTDEstimatorState,
+#     opelstd_update,
+#     opelstd,
+# )
+from tridiagonal_lstd import (
+    DQTridiagLSTDEstimatorState,
+    dq_tridiag_lstd_update,
+    dq_tridiag_lstd,
+    OPETridiagLSTDEstimatorState,
+    ope_tridiag_lstd_update,
+    ope_tridiag_lstd,
 )
 from typing import Dict, Tuple, Any
 import chex
@@ -27,14 +28,15 @@ from functools import partial
 
 ex = Experiment("birth-death")
 
+
 @ex.config
 def config():
-    N = 1000  # Maximum population
+    N = 500  # Maximum population
     lam = 1.0  # Arrival rate
     mu = 1.0  # Service rate
     p0 = 0.315  # Success probability for action 0
     p1 = 0.3937  # Success probability for action 1
-    episode_length = 1000  # Steps per episode
+    episode_length = 10000  # Steps per episode
     num_episodes = 10  # Number of episodes to run
     p = 0.5  # Treatment probability
     output = "birth_death_results.csv"  # Output file for results
@@ -70,46 +72,31 @@ def naive(est: NaiveEstimatorState):
     return avg_rewards[1] - avg_rewards[0]
 
 
-def obs_to_repr(N, obs):
-    """Convert observation to sparse one-hot representation"""
-    s = obs[0].astype(jnp.int32)
-    # Create sparse one-hot vector
-    indices = jnp.array([[s]])
-    data = jnp.ones(1, dtype=jnp.float32)
-    return jsparse.BCOO((data, indices), shape=(N + 1,))
-
-
-def init_estimator_states(phi, r, z, p):
-    d = phi.shape[0]
+def init_estimator_states(N, obs, r, z, p):
     return {
         "naive": NaiveEstimatorState.init(),
-        # "dqlstd": DQLSTDEstimatorState.init(d, phi, r, z, p),
-        # "opelstd": OPELSTDEstimatorState.init(d, phi, r),
-        "sparse_dqlstd": SparseDQLSTDEstimatorState.init(d, phi, r, z, p),
-        "sparse_opelstd": SparseOPELSTDEstimatorState.init(d, phi, r),
+        "dqtridiag": DQTridiagLSTDEstimatorState.init(N + 1, obs.astype(jnp.int32), r, z, p),
+        "opetridiag": OPETridiagLSTDEstimatorState.init(N + 1, obs.astype(jnp.int32), r, z),
     }
 
 
 @partial(
     jax.jit, static_argnames=("env", "params", "num_episodes", "episode_length")
 )
-def run_episodes(env, params, num_episodes=100, episode_length=1000, p=0.5):
+def run_episodes(env, params, seed, num_episodes=100, episode_length=1000, p=0.5):
     """Run multiple episodes and return dictionary of estimator results."""
 
     estimators = {
         "naive": naive_update,
-        # "dqlstd": partial(dqlstd_update, partial(obs_to_repr, params.N), p),
-        # "opelstd": partial(opelstd_update, partial(obs_to_repr, params.N)),
-        "sparse_dqlstd": partial(sparse_dqlstd_update, partial(obs_to_repr, params.N), p),
-        "sparse_opelstd": partial(sparse_opelstd_update, partial(obs_to_repr, params.N)),
+        # Memory requirements for typical DQLSTD / OPELSTD too high
+        "dqtridiag": partial(dq_tridiag_lstd_update, p),
+        "opetridiag": ope_tridiag_lstd_update,
     }
 
     estimator_fns = {
         "naive": naive,
-        # "dqlstd": dqlstd,
-        # "opelstd": opelstd,
-        "sparse_dqlstd": sparse_dqlstd,
-        "sparse_opelstd": sparse_opelstd,
+        "dqtridiag": dq_tridiag_lstd,
+        "opetridiag": ope_tridiag_lstd,
     }
 
     def run_episode(key):
@@ -119,22 +106,20 @@ def run_episodes(env, params, num_episodes=100, episode_length=1000, p=0.5):
         # First step to initialize estimators
         key, key_action = jax.random.split(scan_key)
         z = jax.random.bernoulli(key_action, p=p)
-        action = z.astype(jnp.int32)
+        action = z #.astype(jnp.int32)
         key, key_step = jax.random.split(key)
         next_obs, next_state, reward, _, _ = env.step(
             key_step, state, action, params
         )
 
         # Initialize estimators
-        ests = init_estimator_states(
-            obs_to_repr(params.N, next_obs), jnp.array(reward), z, p
-        )
+        ests = init_estimator_states(params.N, next_obs, jnp.array(reward), z, p)
 
         def step_fn(carry, t):
             obs, state, ests, key = carry
             key, key_action = jax.random.split(key)
             z = jax.random.bernoulli(key_action, p=p)
-            action = z.astype(jnp.int32)
+            action = z
             key, key_step = jax.random.split(key)
             next_obs, next_state, reward, _, _ = env.step(
                 key_step, state, action, params
@@ -142,7 +127,7 @@ def run_episodes(env, params, num_episodes=100, episode_length=1000, p=0.5):
 
             # Update all estimators
             new_ests = {
-                name: update_fn(ests[name], reward, obs, z)
+                name: update_fn(ests[name], reward, obs.astype(jnp.int32), z)
                 for name, update_fn in estimators.items()
             }
 
@@ -160,29 +145,24 @@ def run_episodes(env, params, num_episodes=100, episode_length=1000, p=0.5):
         }
 
         # Add LSTD estimates with different parameters
-        for lam2 in range(12):  # -6 to +5 in log scale
-            lam = 10 ** ((lam2 - 6) / 2)  # Ranges from 1e-3 to 1e+2.5
+        for lam2 in range(-12, 6):  # -5 to +3 in log scale
+            lam = 10 ** (lam2 / 2)  # Ranges from 1e-3 to 1e+2.5
+            opetridiag_name = f"opetridiag-lam={lam:.1e}"
+            results[opetridiag_name] = ope_tridiag_lstd(
+                final_ests["opetridiag"], lam
+            )
             for gamma in [1.0, 0.999, 0.995, 0.99]:
-                # DQLSTD with different parameters
-                dqlstd_name = f"dqlstd-lam={lam:.1e}-gam={gamma}"
-                results[dqlstd_name] = dqlstd(final_ests["dqlstd"], lam, gamma)
+                # Tridiagonal DQLSTD with different parameters
+                dqtridiag_name = f"dqtridiag-lam={lam:.1e}-gam={gamma}"
+                results[dqtridiag_name] = dq_tridiag_lstd(
+                    final_ests["dqtridiag"], lam, gamma
+                )
 
-                # OPELSTD with different parameters
-                opelstd_name = f"opelstd-lam={lam:.1e}-gam={gamma}"
-                results[opelstd_name] = opelstd(final_ests["opelstd"], lam, gamma)
-                
-                # Sparse DQLSTD with different parameters
-                sparse_dqlstd_name = f"sparse_dqlstd-lam={lam:.1e}-gam={gamma}"
-                results[sparse_dqlstd_name] = sparse_dqlstd(final_ests["sparse_dqlstd"], lam, gamma)
-                
-                # Sparse OPELSTD with different parameters
-                sparse_opelstd_name = f"sparse_opelstd-lam={lam:.1e}-gam={gamma}"
-                results[sparse_opelstd_name] = sparse_opelstd(final_ests["sparse_opelstd"], lam, gamma)
+                # Tridiagonal OPELSTD with different parameters
 
         return results
 
-
-    keys = jax.random.split(jax.random.PRNGKey(0), num_episodes)
+    keys = jax.random.split(jax.random.PRNGKey(seed), num_episodes)
     episode_results = jax.vmap(run_episode)(keys)
 
     # Average results across episodes
@@ -190,31 +170,37 @@ def run_episodes(env, params, num_episodes=100, episode_length=1000, p=0.5):
 
 
 @ex.automain
-def main(N, lam, mu, p0, p1, episode_length, num_episodes, p, output, config_output, _config):
+def main(
+    N,
+    lam,
+    mu,
+    p0,
+    p1,
+    episode_length,
+    num_episodes,
+    p,
+    output,
+    config_output,
+    _config,
+    _seed
+):
     env = BirthDeath()
-    params = env.default_params.replace(
-        N=N,
-        lam=lam,
-        mu=mu,
-        p0=p0,
-        p1=p1
-    )
-    
+    params = env.default_params.replace(N=N, lam=lam, mu=mu, p0=p0, p1=p1)
+
     results = run_episodes(
-        env, 
-        params, 
-        episode_length=episode_length, 
-        num_episodes=num_episodes, 
-        p=p
+        env,
+        params,
+        seed=_seed,
+        episode_length=episode_length,
+        num_episodes=num_episodes,
+        p=p,
     )
-    
+
     # Save configuration
     pd.DataFrame.from_dict([_config]).to_csv(config_output, index=False)
-    
+
     # Convert results to DataFrame and save
-    results_df = pd.DataFrame(
-        {name: results[name] for name in results.keys()}
-    )
+    results_df = pd.DataFrame({name: results[name] for name in results.keys()})
     results_df.to_csv(output, index=False)
-    
+
     return results

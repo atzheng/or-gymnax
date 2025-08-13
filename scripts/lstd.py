@@ -4,6 +4,7 @@ from flax import struct
 from jax import Array
 from jaxtyping import Float, Integer, Bool
 from typing import Tuple, Callable, Optional
+from step import StepInfo
 
 
 # Base LSTD
@@ -164,9 +165,8 @@ def dqlstd_update(
     obs_to_repr: Callable[[Float[Array, "d_obs"]], Float[Array, "d"]],
     p: float,
     est: DQLSTDEstimatorState,
-    reward: float,
     obs: Float[Array, "d_obs"],
-    z: Bool,
+    stepinfo: StepInfo,
 ) -> DQLSTDEstimatorState:
     """
     Update LSTD Q-learning parameters using Sherman-Morrison formula
@@ -178,19 +178,25 @@ def dqlstd_update(
     """
     phi = obs_to_repr(obs)
 
+    is_A = stepinfo.action == stepinfo.action_A
+    is_B = stepinfo.action == stepinfo.action_B
+    # Get correct probs where actions A, B are the same
+    pA = is_A * is_B + is_A * (1 - is_B) * (1 - p)
+    pB = is_B * is_A + is_B * (1 - is_A) * p
+
     prev_ips_tr = est.prev_z / p
     prev_r_tr = prev_ips_tr * est.prev_r
     phi_tr = prev_ips_tr * phi
     sum_phi_tr = est.sum_phi_tr + phi_tr
     sum_r_tr = est.lstd_tr.sum_r + prev_r_tr
-    lstd_tr = lstd_update(est.lstd_tr, phi, z / p * reward)
+    lstd_tr = lstd_update(est.lstd_tr, phi, is_B / p * stepinfo.reward)
 
     prev_ips_co = (1 - est.prev_z) / (1 - p)
     prev_r_co = prev_ips_co * est.prev_r
     phi_co = prev_ips_co * phi
     sum_phi_co = est.sum_phi_co + phi_co
     sum_r_co = est.lstd_co.sum_r + prev_r_co
-    lstd_co = lstd_update(est.lstd_co, phi, (1 - z) / (1 - p) * reward)
+    lstd_co = lstd_update(est.lstd_co, phi, is_A / p_A * stepinfo.reward)
 
     return DQLSTDEstimatorState(
         lstd_tr=lstd_tr,
@@ -199,8 +205,8 @@ def dqlstd_update(
         lstd_co=lstd_co,
         sum_phi_co=sum_phi_co,
         sum_r_co=sum_r_co,
-        prev_z=z,
-        prev_r=reward,
+        prev_z=stepinfo.is_treat,
+        prev_r=stepinfo.reward,
     )
 
 
@@ -254,9 +260,8 @@ def dqlstdpg_update(
     obs_to_repr: Callable[[Float[Array, "d_obs"]], Float[Array, "d"]],
     p: float,
     est: DQLSTDPGEstimatorState,
-    reward: Float[Array, "1"],
     obs: Float[Array, "d_obs"],
-    z: Bool,
+    stepinfo: StepInfo,
 ) -> DQLSTDEstimatorState:
     """
     Update LSTD Q-learning parameters using Sherman-Morrison formula
@@ -278,7 +283,7 @@ def dqlstdpg_update(
     sum_phi_co = est.sum_phi_co + phi_co
     sum_r_co = est.sum_r_co + prev_ips_co * est.lstd.r
 
-    lstd = lstd_update(est.lstd, phi, reward)
+    lstd = lstd_update(est.lstd, phi, stepinfo.reward)
 
     return DQLSTDPGEstimatorState(
         lstd=lstd,
@@ -286,7 +291,7 @@ def dqlstdpg_update(
         sum_r_co=sum_r_co,
         sum_phi_tr=sum_phi_tr,
         sum_phi_co=sum_phi_co,
-        prev_z=z,
+        prev_z=stepinfo.is_treat,
     )
 
 
@@ -329,29 +334,28 @@ class OPELSTDEstimatorState:
 def opelstd_update(
     obs_to_repr: Callable[[Float[Array, "d_obs"]], Float[Array, "d"]],
     est: OPELSTDEstimatorState,
-    reward: Float[Array, "1"],
     obs: Float[Array, "d_obs"],
-    z: Bool,
+    stepinfo: StepInfo,
 ):
     phi = obs_to_repr(obs)
 
     new_lstd_tr = lstd_update(
-        est.lstd_tr.replace(phi=est.prev_phi, r=est.prev_r), phi, reward
+        est.lstd_tr.replace(phi=est.prev_phi, r=est.prev_r), phi, stepinfo.reward
     )
 
     new_lstd_co = lstd_update(
-        est.lstd_co.replace(phi=est.prev_phi, r=est.prev_r), phi, reward
+        est.lstd_co.replace(phi=est.prev_phi, r=est.prev_r), phi, stepinfo.reward
     )
 
     return OPELSTDEstimatorState(
         lstd_tr=jax.lax.cond(
-            est.prev_z, lambda: new_lstd_tr, lambda: est.lstd_tr
+            est.prev_z & stepinfo.is_treat, lambda: new_lstd_tr, lambda: est.lstd_tr
         ),
         lstd_co=jax.lax.cond(
-            ~est.prev_z, lambda: new_lstd_co, lambda: est.lstd_co
+            ~est.prev_z & ~stepinfo.is_treat, lambda: new_lstd_co, lambda: est.lstd_co
         ),
-        prev_z=z,
-        prev_r=reward,
+        prev_z=stepinfo.is_treat,
+        prev_r=stepinfo.reward,
         prev_phi=phi,
     )
 
