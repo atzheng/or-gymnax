@@ -90,11 +90,11 @@ def get_random_event(
     key1, key2 = jax.random.split(key)
     idx = jax.random.randint(key1, (), 0, event.t.shape[0])
     # Get interarrival time from the sampled event
-    interarrival = jnp.where(idx > 0, event.t[idx] - event.t[idx-1], event.t[0])
+    interarrival = jnp.where(
+        idx > 0, event.t[idx] - event.t[idx - 1], event.t[0]
+    )
     return RideshareEvent(
-        current_time + interarrival,
-        event.src[idx],
-        event.dest[idx]
+        current_time + interarrival, event.src[idx], event.dest[idx]
     )
 
 
@@ -124,10 +124,10 @@ class RideshareDispatch(environment.Environment[EnvState, EnvParams]):
         params: EnvParams,
     ) -> Tuple[chex.Array, EnvState, jnp.ndarray, jnp.ndarray, Dict[Any, Any]]:
         """Performs step transitions in the environment."""
-        return jax.lax.cond(
-            action >= 0,
-            lambda: self.step_env_dispatch(key, state, action, params),
-            lambda: self.step_env_unfulfill(key, state, action, params),
+        return jax.tree.map(
+            lambda x, y: jax.lax.select(action >= 0, x, y),
+            self.step_env_dispatch(key, state, action, params),
+            self.step_env_unfulfill(key, state, action, params),
         )
 
     def step_env_unfulfill(
@@ -475,12 +475,7 @@ class GreedyPolicy(Policy):
             # Don't dispatch unreachable nodes
             - (env_params.distances[locations, event.src] < 0) * jnp.inf
         )
-
-        action = jax.random.choice(
-            rng,
-            jnp.arange(self.n_cars),
-            p=jnp.exp((rewards - jnp.max(rewards)) / self.temperature),
-        )
+        action = jax.random.categorical(rng, rewards / self.temperature)
         return action, {}
 
     def get_costs(
