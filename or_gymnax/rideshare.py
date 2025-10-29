@@ -138,7 +138,7 @@ class RideshareDispatch(environment.Environment[EnvState, EnvParams]):
         params: EnvParams,
     ) -> Tuple[chex.Array, EnvState, jnp.ndarray, jnp.ndarray, Dict[Any, Any]]:
         key, event_key = jax.random.split(state.key)
-        next_event = get_random_event(event_key, params.events, state.event.t)
+        next_event = get_nth_event(params.events, state.time + 1)
         next_state = EnvState(
             time=state.time + 1,
             locations=state.locations,
