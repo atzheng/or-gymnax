@@ -81,6 +81,10 @@ class PricingEnvParams(environment.EnvParams):
         return self.dispatch_env_params.n_cars
 
 
+def get_nth_event(events: RideshareEvent, n: int) -> RideshareEvent:
+    return RideshareEvent(events.t[n], events.src[n], events.dest[n])
+
+
 def get_random_event(
     key: chex.PRNGKey,
     event: RideshareEvent,
