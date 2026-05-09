@@ -313,7 +313,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             time=state.time + 1,
             waypoints=state.waypoints,
             times=state.times,
-            key=state.key,
+            key=key,
             event=next_event,
         )
         done = self.is_terminal(next_state, params)
@@ -365,13 +365,13 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         # checkify.check(is_feasible, "Trip being inserted should be feasible for car")
         new_waypoints = state.waypoints.at[action].set(new_car_wps)
         new_times = state.times.at[action].set(new_car_times)
-        key, event_key = jax.random.split(key)
+        key, event_key = jax.random.split(state.key)
         next_event = rs.get_random_event(event_key, params.events, state.event.t)
         next_state = EnvState(
             time=state.time + 1,
             waypoints=new_waypoints,
             times=new_times,
-            key=state.key,
+            key=key,
             event=next_event,
         )
         done = self.is_terminal(next_state, params)
