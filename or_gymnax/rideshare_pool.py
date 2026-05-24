@@ -493,6 +493,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             ),
             "n_ghost_triggers": jnp.sum(triggered),
             "n_active_ghosts": jnp.sum(ghost_active),
+            "step": state.time,
         }
 
         return new_ghost_wps, new_ghost_ts, ghost_active, ghost_info
