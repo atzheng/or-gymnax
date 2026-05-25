@@ -615,26 +615,38 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         new_waypoints = state.waypoints.at[canonical_car].set(new_car_wps)
         new_times = state.times.at[canonical_car].set(new_car_times)
 
-        # Phase 3: Create new ghost pair
+        # Phase 3: Create new ghost pair (skip if canonical == counterfactual)
+        same_car = (canonical_car == counterfactual_car)
         ghost_pair = create_ghost_pair(
             params.distances, state, canonical_car, counterfactual_car,
             state.event, params.max_active_trips, params.max_exclusions,
         )
         gp_wps, gp_ts, gp_types, gp_excluded, gp_n_excluded = ghost_pair
 
-        # Write ghost state: first apply trigger updates, then write new pair
+        # Write ghost state: first apply trigger updates, then write new pair.
+        # Skip writing when canonical == counterfactual (no counterfactual world to track).
         state_with_updated_ghosts = state.replace(
             ghost_waypoints=new_ghost_wps,
             ghost_times=new_ghost_ts,
             ghost_active=ghost_active,
         )
+
+        def _write_ghosts(_):
+            return write_ghosts_to_buffer(
+                state_with_updated_ghosts,
+                gp_wps, gp_ts, gp_types, gp_excluded, gp_n_excluded,
+                state.event.t, params.max_ghosts,
+            )
+
+        def _skip_ghosts(_):
+            s = state_with_updated_ghosts
+            return (s.ghost_waypoints, s.ghost_times, s.ghost_birth_time,
+                    s.ghost_origin_step, s.ghost_type, s.ghost_active,
+                    s.ghost_excluded_cars, s.ghost_n_excluded, s.ghost_write_idx)
+
         (g_waypoints, g_times, g_birth_time, g_origin_step,
          g_type, g_active, g_excluded_cars, g_n_excluded,
-         g_write_idx) = write_ghosts_to_buffer(
-            state_with_updated_ghosts,
-            gp_wps, gp_ts, gp_types, gp_excluded, gp_n_excluded,
-            state.event.t, params.max_ghosts,
-        )
+         g_write_idx) = jax.lax.cond(~same_car, _write_ghosts, _skip_ghosts, None)
 
         key, event_key = jax.random.split(state.key)
         next_event = rs.get_random_event(event_key, params.events, state.event.t)

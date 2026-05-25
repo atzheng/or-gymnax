@@ -219,6 +219,43 @@ def test_exclusion_prevents_self_comparison():
     assert excl == {0, 1}
 
 
+def test_no_ghost_when_same_car():
+    """When canonical == counterfactual, no ghosts are created and write_idx is unchanged."""
+    key = jax.random.PRNGKey(0)
+    _, state = ENV.reset_env(key, ENV_PARAMS)
+
+    action = jnp.array([0, 0])
+    _, state2, _, _, _ = ENV.step_env(key, state, action, ENV_PARAMS)
+
+    assert jnp.sum(state2.ghost_active) == 0, \
+        f"Expected 0 active ghosts, got {jnp.sum(state2.ghost_active)}"
+    assert int(state2.ghost_write_idx) == int(state.ghost_write_idx), \
+        f"Expected write_idx={state.ghost_write_idx}, got {state2.ghost_write_idx}"
+
+
+def test_ghost_buffer_position_after_skip():
+    """Ghost buffer position accounting is correct when a same-car step skips creation."""
+    ep = ENV_PARAMS.replace(max_ghosts=8, ghost_max_lifespan=100)
+    key = jax.random.PRNGKey(0)
+    _, state = ENV.reset_env(key, ep)
+
+    # Same-car: write_idx must stay at 0
+    key, sk = jax.random.split(key)
+    _, s1, _, _, _ = ENV.step_env(sk, state, jnp.array([0, 0]), ep)
+    assert int(s1.ghost_write_idx) == 0
+    assert jnp.sum(s1.ghost_active) == 0
+
+    # Different cars: ghosts written at positions 0,1 (not 2,3)
+    key, sk = jax.random.split(key)
+    _, s2, _, _, _ = ENV.step_env(sk, s1, jnp.array([0, 1]), ep)
+    assert int(s2.ghost_write_idx) == 2
+    assert jnp.sum(s2.ghost_active) == 2
+    assert s2.ghost_origin_step[0] == s1.time, \
+        f"Expected origin_step[0]={s1.time}, got {s2.ghost_origin_step[0]}"
+    assert s2.ghost_origin_step[1] == s1.time, \
+        f"Expected origin_step[1]={s1.time}, got {s2.ghost_origin_step[1]}"
+
+
 def test_jit_and_scan_compatible():
     """Ghost-tracked env should work under jit and lax.scan."""
     key = jax.random.PRNGKey(0)
