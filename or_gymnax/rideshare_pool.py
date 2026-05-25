@@ -479,7 +479,6 @@ def greedy_select_car(
     event: rs.RideshareEvent,
     max_active_trips: int,
     savings_threshold: float,
-    exclude_car: int,
 ) -> Tuple[Integer[Array, ""], Bool[Array, ""]]:
     """Select the cheapest eligible car under the savings threshold.
 
@@ -487,7 +486,6 @@ def greedy_select_car(
     is below direct_cost * (1 - savings_threshold), where direct_cost is
     the pickup-to-dropoff distance.
 
-    exclude_car: car index to skip (pass -1 for no exclusion).
     Returns (car_idx, found); car_idx is valid only when found=True.
     """
     direct_cost = distances[event.src, event.dest]
@@ -502,10 +500,6 @@ def greedy_select_car(
         return cost, eligible
 
     costs, eligible = jax.vmap(cost_one)(waypoints, times)
-
-    n_cars = costs.shape[0]
-    exclude_mask = jnp.arange(n_cars, dtype=jnp.int32) == exclude_car
-    eligible = eligible & ~exclude_mask
 
     maxint = jnp.iinfo(costs.dtype).max
     masked_costs = jnp.where(eligible, costs, maxint)
@@ -568,7 +562,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
 
         The environment internally selects the canonical car (cheapest eligible
         under threshold_A) and the counterfactual car (cheapest eligible under
-        threshold_B, excluding canonical). Dispatches to canonical if found,
+        threshold_B). Dispatches to canonical if found,
         otherwise unfulfills.
         """
         threshold_a = action[0].astype(jnp.float32)
@@ -577,12 +571,10 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         canonical_car, canonical_found = greedy_select_car(
             params.distances, state.waypoints, state.times, state.event,
             params.max_active_trips, threshold_a,
-            jnp.array(-1, dtype=jnp.int32),
         )
         cf_car, cf_found = greedy_select_car(
             params.distances, state.waypoints, state.times, state.event,
             params.max_active_trips, threshold_b,
-            canonical_car,
         )
         # If no cf car found, fall back to canonical (triggers same-car skip)
         cf_car = jnp.where(cf_found, cf_car, canonical_car)
