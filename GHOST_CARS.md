@@ -30,9 +30,13 @@ Both cases represent a divergence between the real and counterfactual worlds —
 
 Each ghost tracks which real cars have been displaced in its counterfactual world via `ghost_excluded_cars` (a fixed-size array of car indices, padded with -1). For depth-0 (no branching), each ghost excludes exactly one car: the one it forked from. The max exclusion size is `ghost_max_branch_depth + 1`.
 
+### Same-car skip
+
+If `action[0] == action[1]` (canonical and counterfactual are the same car), the two counterfactual worlds are identical and there is nothing to track. No ghost pair is created and `ghost_write_idx` is **not** advanced. All existing ghosts and their state (including `ghost_origin_step`) are left intact, so trigger detection and origin-step reporting for pre-existing ghosts are unaffected. The next genuine dispatch writes to the same buffer positions that would have been used had the skip not occurred.
+
 ### Ring buffer
 
-Ghosts are stored in a fixed-size buffer of `max_ghosts` slots. A `ghost_write_idx` pointer advances by 2 each dispatch step, wrapping via modulo. Old ghosts are also deactivated when they exceed `ghost_max_lifespan`.
+Ghosts are stored in a fixed-size buffer of `max_ghosts` slots. A `ghost_write_idx` pointer advances by 2 each dispatch step where `canonical != counterfactual`, wrapping via modulo. Old ghosts are also deactivated when they exceed `ghost_max_lifespan`.
 
 ### Expiry ordering
 
@@ -95,7 +99,7 @@ All in `or_gymnax/rideshare_pool.py`:
 
 ## Tests
 
-`tests/test_ghost_cars.py` — 9 tests sharing a single env instance (to avoid a gymnax JIT caching bug):
+`tests/test_ghost_cars.py` — 12 tests sharing a single env instance (to avoid a gymnax JIT caching bug):
 
 1. **Smoke test** — env compiles and runs with ghost tracking
 2. **Ghost creation** — exactly 2 ghosts created per dispatch, types 0 and 1
@@ -106,6 +110,9 @@ All in `or_gymnax/rideshare_pool.py`:
 7. **Exclusion sets** — correct car indices in exclusion lists
 8. **JIT + scan compatibility** — works under `jax.jit` and `jax.lax.scan`
 9. **Policy action shape** — `GreedyPolicy` returns `(2,)` action
+10. **No ghost when same car** — no ghosts created and `ghost_write_idx` unchanged when canonical == counterfactual
+11. **Buffer position after skip** — `ghost_write_idx` and `ghost_origin_step` are correct for ghosts created immediately after a same-car skip
+12. **Oracle after same-car skip** — oracle test verifying that ghost pairs created after a skip produce correct trigger patterns and origin-step reporting over 6 future steps
 
 Run with: `python -m pytest tests/test_ghost_cars.py -p no:logfire`
 

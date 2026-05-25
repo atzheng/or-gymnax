@@ -256,6 +256,94 @@ def test_ghost_buffer_position_after_skip():
         f"Expected origin_step[1]={s1.time}, got {s2.ghost_origin_step[1]}"
 
 
+def test_oracle_ghost_triggers_after_same_car_skip():
+    """
+    Oracle test: ghost pairs created immediately after a same-car skip produce
+    correct trigger patterns and origin-step reporting over future steps.
+
+    The same-car step leaves ghost_write_idx at 0, so the subsequent fork writes
+    ghosts to positions 0 and 1.  We then run 6 future steps and compare the
+    tracker's trigger output against an independent oracle simulation.
+    """
+    key = jax.random.PRNGKey(7)
+    ep = ENV_PARAMS.replace(ghost_max_lifespan=20, max_ghosts=64)
+    _, state = ENV.reset_env(key, ep)
+
+    # Step 1: same-car dispatch — no ghost created, write_idx stays 0
+    key, sk = jax.random.split(key)
+    _, s1, _, _, _ = ENV.step_env(sk, state, jnp.array([0, 0]), ep)
+    assert int(s1.ghost_write_idx) == 0
+
+    # Step 2: fork — ghosts go to positions 0,1 (not 2,3)
+    canonical_car, cf_car = 0, 2
+    key, sk = jax.random.split(key)
+    _, real_state, _, _, _ = ENV.step_env(sk, s1, jnp.array([canonical_car, cf_car]), ep)
+    assert int(real_state.ghost_write_idx) == 2
+
+    # Oracle: cf car 2 gets the fork trip, track its evolving state independently
+    cf_wp, cf_t, _, _ = insert_and_optimize_trip(
+        ep.distances,
+        s1.waypoints[cf_car], s1.times[cf_car],
+        s1.event.src, s1.event.dest, s1.event.t,
+        ep.max_active_trips,
+    )
+    oracle_cf_wp, oracle_cf_t = cf_wp, cf_t
+    ghost_birth_time = int(s1.event.t)
+
+    # Locate the type-1 (cf-dispatched) ghost written at the fork step
+    ghost_type1_idx = jnp.argmax(
+        real_state.ghost_active & (real_state.ghost_type == 1)
+        & (real_state.ghost_origin_step == s1.time)
+    )
+    expected_origin_step = int(s1.time)
+    assert int(real_state.ghost_origin_step[ghost_type1_idx]) == expected_origin_step
+
+    real_s = real_state
+    maxint = jnp.iinfo(jnp.int32).max
+    oracle_active = True
+
+    for i in range(6):
+        key, sk = jax.random.split(key)
+        event = real_s.event
+
+        cf_new_wp, cf_new_t, cf_cost, cf_feas = insert_and_optimize_trip(
+            ep.distances, oracle_cf_wp, oracle_cf_t,
+            event.src, event.dest, event.t, ep.max_active_trips,
+        )
+        real_costs, real_feasible = compute_real_car_costs(
+            ep.distances, real_s.waypoints, real_s.times,
+            event, ep.max_active_trips,
+        )
+        masked_real = jnp.where(
+            real_feasible & (jnp.arange(_N_CARS) != cf_car), real_costs, maxint,
+        )
+        oracle_ghost_wins = oracle_active & bool(cf_feas & (cf_cost < jnp.min(masked_real)))
+        all_real = jnp.where(real_feasible, real_costs, maxint)
+        best_real_car = int(jnp.argmin(all_real))
+        oracle_canonical_wins = (
+            oracle_active & bool(best_real_car == cf_car) & bool(jnp.min(all_real) < maxint)
+        )
+        oracle_triggered = oracle_ghost_wins | oracle_canonical_wins
+
+        if oracle_ghost_wins:
+            oracle_cf_wp, oracle_cf_t = cf_new_wp, cf_new_t
+
+        _, real_s, _, _, info = ENV.step_env(sk, real_s, jnp.array([0, 1]), ep)
+        tracker_triggered = bool(info["ghost_triggered"][ghost_type1_idx])
+
+        if int(event.t) - ghost_birth_time >= ep.ghost_max_lifespan:
+            oracle_active = False
+
+        assert oracle_triggered == tracker_triggered, (
+            f"Step +{i+1}: oracle={oracle_triggered}, tracker={tracker_triggered}"
+        )
+        if tracker_triggered:
+            reported = int(info["ghost_trigger_origin_steps"][ghost_type1_idx])
+            assert reported == expected_origin_step, (
+                f"Step +{i+1}: trigger origin_step={reported}, expected {expected_origin_step}"
+            )
+
+
 def test_jit_and_scan_compatible():
     """Ghost-tracked env should work under jit and lax.scan."""
     key = jax.random.PRNGKey(0)
