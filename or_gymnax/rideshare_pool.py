@@ -114,6 +114,7 @@ class EnvState(environment.EnvState):
     ghost_active: Bool[Array, "max_ghosts"]
     ghost_excluded_cars: Integer[Array, "max_ghosts max_exclusions"]  # -1 padded
     ghost_n_excluded: Integer[Array, "max_ghosts"]
+    ghost_threshold: Float[Array, "max_ghosts"]  # savings threshold stored per ghost
     ghost_write_idx: Integer[Array, ""]  # ring buffer pointer
 
 
@@ -309,10 +310,11 @@ def check_ghost_triggers(
 ):
     """
     For each active ghost, check if either:
-      (a) the ghost would beat the best feasible real car (excluding canonical), OR
-      (b) a canonical (excluded) car is the best real car overall.
+      (a) the ghost would beat the best eligible real car (excluding canonical), OR
+      (b) a canonical (excluded) car is the best eligible real car overall.
 
-    Both cases represent a divergence between real and counterfactual worlds.
+    Eligibility uses the ghost's stored savings_threshold and direct pickup-to-dropoff
+    cost as the solo baseline (not the cheapest available solo car).
 
     Returns:
         triggered: Bool[max_ghosts] — which ghosts triggered (ghost wins OR canonical wins)
@@ -321,20 +323,20 @@ def check_ghost_triggers(
         ghost_feasible: Bool[max_ghosts] — whether ghost insertion is feasible
     """
     maxint = jnp.iinfo(real_costs.dtype).max
+    direct_cost = distances[event.src, event.dest]
+    real_is_solo = jnp.all(state.times <= event.t, axis=1)
 
-    # Best real car overall (for canonical-wins check)
-    all_real_costs = jnp.where(real_is_feasible, real_costs, maxint)
-    best_real_overall = jnp.min(all_real_costs)
-    best_real_car = jnp.argmin(all_real_costs)
-
-    def check_one_ghost(ghost_wp, ghost_t, excluded_cars, n_excluded, active):
+    def check_one_ghost(ghost_wp, ghost_t, excluded_cars, n_excluded, active, threshold):
         cost, feasible = _ghost_marginal_cost(
             distances, ghost_wp, ghost_t, event, max_active_trips,
         )
+        # Ghost eligibility: solo or passes savings threshold vs direct cost
+        ghost_is_solo = jnp.all(ghost_t <= event.t)
+        ghost_eligible = ghost_is_solo | (cost < direct_cost * (1 - threshold))
+
         # Build exclusion mask for this ghost
         exclude_mask = jnp.zeros(real_costs.shape[0], dtype=bool)
         exclude_mask = exclude_mask.at[excluded_cars].set(True)
-        # Only exclude valid indices (n_excluded mask)
         idx_range = jnp.arange(excluded_cars.shape[0])
         valid_exclusion = idx_range < n_excluded
         exclude_mask = jnp.where(
@@ -342,14 +344,23 @@ def check_ghost_triggers(
             exclude_mask,
             jnp.zeros_like(exclude_mask),
         )
-        # Ghost wins: ghost beats real fleet (excluding canonical cars)
-        masked_real = jnp.where(
-            exclude_mask | ~real_is_feasible, maxint, real_costs,
+
+        # Real car eligibility with this ghost's threshold
+        real_eligible = real_is_feasible & (
+            real_is_solo | (real_costs < direct_cost * (1 - threshold))
         )
+
+        # Ghost wins: ghost beats eligible real fleet (excluding canonical cars)
+        masked_real = jnp.where(exclude_mask | ~real_eligible, maxint, real_costs)
         best_real = jnp.min(masked_real)
-        ghost_wins = active & feasible & (cost < best_real)
-        # Canonical wins: one of the excluded cars is the best real car
-        canonical_wins = active & exclude_mask[best_real_car] & (best_real_overall < maxint)
+        ghost_wins = active & feasible & ghost_eligible & (cost < best_real)
+
+        # Canonical wins: excluded car is best eligible real car
+        eligible_real_costs = jnp.where(real_eligible, real_costs, maxint)
+        best_real_car = jnp.argmin(eligible_real_costs)
+        canonical_wins = (
+            active & exclude_mask[best_real_car] & (jnp.min(eligible_real_costs) < maxint)
+        )
         triggered = ghost_wins | canonical_wins
         return triggered, ghost_wins, cost, feasible
 
@@ -359,6 +370,7 @@ def check_ghost_triggers(
         state.ghost_excluded_cars,
         state.ghost_n_excluded,
         state.ghost_active,
+        state.ghost_threshold,
     )
     return triggered, ghost_wins, ghost_costs, ghost_feasible
 
@@ -385,13 +397,13 @@ def update_triggered_ghosts(
 
 def create_ghost_pair(
     distances, state, canonical_car, counterfactual_car, event,
-    max_active_trips, max_exclusions,
+    max_active_trips, max_exclusions, threshold_a, threshold_b,
 ):
     """
     Create two ghost cars:
       Ghost A: canonical car's current state (WITHOUT the new trip)
       Ghost B: counterfactual car's state WITH the trip added
-    Returns waypoints, times, types, and exclusion arrays for both.
+    Returns waypoints, times, types, exclusion arrays, and per-ghost thresholds.
     """
     # Ghost A: snapshot of canonical car pre-dispatch
     ghost_a_wp = state.waypoints[canonical_car]
@@ -411,16 +423,17 @@ def create_ghost_pair(
     ghost_b_excluded = empty_exclusions.at[0].set(counterfactual_car)
 
     return (
-        jnp.stack([ghost_a_wp, ghost_b_wp]),       # (2, max_waypoints)
-        jnp.stack([ghost_a_t, ghost_b_t]),          # (2, max_waypoints)
-        jnp.array([0, 1], dtype=jnp.int32),         # types
-        jnp.stack([ghost_a_excluded, ghost_b_excluded]),  # (2, max_exclusions)
-        jnp.array([1, 1], dtype=jnp.int32),         # n_excluded
+        jnp.stack([ghost_a_wp, ghost_b_wp]),                          # (2, max_waypoints)
+        jnp.stack([ghost_a_t, ghost_b_t]),                            # (2, max_waypoints)
+        jnp.array([0, 1], dtype=jnp.int32),                          # types
+        jnp.stack([ghost_a_excluded, ghost_b_excluded]),              # (2, max_exclusions)
+        jnp.array([1, 1], dtype=jnp.int32),                          # n_excluded
+        jnp.array([threshold_a, threshold_b], dtype=jnp.float32),    # thresholds
     )
 
 
 def write_ghosts_to_buffer(state, new_wps, new_ts, new_types,
-                           new_excluded, new_n_excluded,
+                           new_excluded, new_n_excluded, new_thresholds,
                            current_time, max_ghosts):
     """Write 2 new ghosts into the ring buffer at ghost_write_idx."""
     idx0 = state.ghost_write_idx % max_ghosts
@@ -434,11 +447,12 @@ def write_ghosts_to_buffer(state, new_wps, new_ts, new_types,
     ghost_active = state.ghost_active.at[idx0].set(True).at[idx1].set(True)
     ghost_excluded_cars = state.ghost_excluded_cars.at[idx0].set(new_excluded[0]).at[idx1].set(new_excluded[1])
     ghost_n_excluded = state.ghost_n_excluded.at[idx0].set(new_n_excluded[0]).at[idx1].set(new_n_excluded[1])
+    ghost_threshold = state.ghost_threshold.at[idx0].set(new_thresholds[0]).at[idx1].set(new_thresholds[1])
     ghost_write_idx = (state.ghost_write_idx + 2) % max_ghosts
 
     return (ghost_waypoints, ghost_times, ghost_birth_time, ghost_origin_step,
             ghost_type, ghost_active, ghost_excluded_cars, ghost_n_excluded,
-            ghost_write_idx)
+            ghost_threshold, ghost_write_idx)
 
 
 def expire_ghosts(state, current_time, ghost_max_lifespan):
@@ -456,6 +470,48 @@ def compute_real_car_costs(distances, waypoints, times, event, max_active_trips)
         )
         return cost, feasible
     return jax.vmap(cost_one)(waypoints, times)
+
+
+def greedy_select_car(
+    distances,
+    waypoints: Integer[Array, "n_cars max_waypoints"],
+    times: Integer[Array, "n_cars max_waypoints"],
+    event: rs.RideshareEvent,
+    max_active_trips: int,
+    savings_threshold: float,
+    exclude_car: int,
+) -> Tuple[Integer[Array, ""], Bool[Array, ""]]:
+    """Select the cheapest eligible car under the savings threshold.
+
+    A car is eligible if it is solo (no active trips) or its marginal cost
+    is below direct_cost * (1 - savings_threshold), where direct_cost is
+    the pickup-to-dropoff distance.
+
+    exclude_car: car index to skip (pass -1 for no exclusion).
+    Returns (car_idx, found); car_idx is valid only when found=True.
+    """
+    direct_cost = distances[event.src, event.dest]
+
+    def cost_one(car_wp, car_t):
+        is_solo = jnp.all(car_t <= event.t)
+        _, _, cost, feasible = insert_and_optimize_trip(
+            distances, car_wp, car_t,
+            event.src, event.dest, event.t, max_active_trips,
+        )
+        eligible = feasible & (is_solo | (cost < direct_cost * (1 - savings_threshold)))
+        return cost, eligible
+
+    costs, eligible = jax.vmap(cost_one)(waypoints, times)
+
+    n_cars = costs.shape[0]
+    exclude_mask = jnp.arange(n_cars, dtype=jnp.int32) == exclude_car
+    eligible = eligible & ~exclude_mask
+
+    maxint = jnp.iinfo(costs.dtype).max
+    masked_costs = jnp.where(eligible, costs, maxint)
+    car_idx = jnp.argmin(masked_costs)
+    found = jnp.any(eligible)
+    return car_idx, found
 
 
 class RidesharePoolDispatch(rs.RideshareDispatch):
@@ -502,24 +558,47 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         self,
         key: chex.PRNGKey,
         state: EnvState,
-        action: Integer[Array, "2"],
+        action: Float[Array, "2"],
         params: EnvParams,
     ) -> Tuple[chex.Array, EnvState, jnp.ndarray, jnp.ndarray, Dict[Any, Any]]:
         """Performs step transitions in the environment.
-        action[0] = canonical car, action[1] = counterfactual car.
-        Use action[0] < 0 to signal unfulfill.
+
+        action[0] = savings_threshold for the canonical (treatment A) policy.
+        action[1] = savings_threshold for the counterfactual (treatment B) policy.
+
+        The environment internally selects the canonical car (cheapest eligible
+        under threshold_A) and the counterfactual car (cheapest eligible under
+        threshold_B, excluding canonical). Dispatches to canonical if found,
+        otherwise unfulfills.
         """
+        threshold_a = action[0].astype(jnp.float32)
+        threshold_b = action[1].astype(jnp.float32)
+
+        canonical_car, canonical_found = greedy_select_car(
+            params.distances, state.waypoints, state.times, state.event,
+            params.max_active_trips, threshold_a,
+            jnp.array(-1, dtype=jnp.int32),
+        )
+        cf_car, cf_found = greedy_select_car(
+            params.distances, state.waypoints, state.times, state.event,
+            params.max_active_trips, threshold_b,
+            canonical_car,
+        )
+        # If no cf car found, fall back to canonical (triggers same-car skip)
+        cf_car = jnp.where(cf_found, cf_car, canonical_car)
+
         return jax.lax.cond(
-            action[0] >= 0,
-            lambda: self.step_env_dispatch(key, state, action, params),
-            lambda: self.step_env_unfulfill(key, state, action, params),
+            canonical_found,
+            lambda: self.step_env_dispatch(
+                key, state, canonical_car, cf_car, threshold_a, threshold_b, params
+            ),
+            lambda: self.step_env_unfulfill(key, state, params),
         )
 
     def step_env_unfulfill(
         self,
         key: chex.PRNGKey,
         state: EnvState,
-        action: Integer[Array, "2"],
         params: EnvParams,
     ) -> Tuple[chex.Array, EnvState, jnp.ndarray, jnp.ndarray, Dict[Any, Any]]:
         # Compute real car costs for ghost comparison
@@ -549,6 +628,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             ghost_active=ghost_active,
             ghost_excluded_cars=state.ghost_excluded_cars,
             ghost_n_excluded=state.ghost_n_excluded,
+            ghost_threshold=state.ghost_threshold,
             ghost_write_idx=state.ghost_write_idx,
         )
         done = self.is_terminal(next_state, params)
@@ -572,6 +652,8 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
                 "utilization": utilization,
                 "pct_cars_on_trip": pct_cars_on_trip,
                 "t": state.event.t,
+                "action_A": jnp.array(-1, dtype=jnp.int32),
+                "action_B": jnp.array(-1, dtype=jnp.int32),
                 **ghost_info,
             },
         )
@@ -580,12 +662,12 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         self,
         key: chex.PRNGKey,
         state: EnvState,
-        action: Integer[Array, "2"],
+        canonical_car: Integer[Array, ""],
+        counterfactual_car: Integer[Array, ""],
+        threshold_a: Float[Array, ""],
+        threshold_b: Float[Array, ""],
         params: EnvParams,
     ) -> Tuple[chex.Array, EnvState, jnp.ndarray, jnp.ndarray, Dict[Any, Any]]:
-        canonical_car = action[0]
-        counterfactual_car = action[1]
-
         # Compute real car costs for ghost comparison
         real_costs, real_is_feasible = compute_real_car_costs(
             params.distances, state.waypoints, state.times,
@@ -620,8 +702,9 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         ghost_pair = create_ghost_pair(
             params.distances, state, canonical_car, counterfactual_car,
             state.event, params.max_active_trips, params.max_exclusions,
+            threshold_a, threshold_b,
         )
-        gp_wps, gp_ts, gp_types, gp_excluded, gp_n_excluded = ghost_pair
+        gp_wps, gp_ts, gp_types, gp_excluded, gp_n_excluded, gp_thresholds = ghost_pair
 
         # Write ghost state: first apply trigger updates, then write new pair.
         # Skip writing when canonical == counterfactual (no counterfactual world to track).
@@ -634,7 +717,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         def _write_ghosts(_):
             return write_ghosts_to_buffer(
                 state_with_updated_ghosts,
-                gp_wps, gp_ts, gp_types, gp_excluded, gp_n_excluded,
+                gp_wps, gp_ts, gp_types, gp_excluded, gp_n_excluded, gp_thresholds,
                 state.event.t, params.max_ghosts,
             )
 
@@ -642,11 +725,12 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             s = state_with_updated_ghosts
             return (s.ghost_waypoints, s.ghost_times, s.ghost_birth_time,
                     s.ghost_origin_step, s.ghost_type, s.ghost_active,
-                    s.ghost_excluded_cars, s.ghost_n_excluded, s.ghost_write_idx)
+                    s.ghost_excluded_cars, s.ghost_n_excluded, s.ghost_threshold,
+                    s.ghost_write_idx)
 
         (g_waypoints, g_times, g_birth_time, g_origin_step,
          g_type, g_active, g_excluded_cars, g_n_excluded,
-         g_write_idx) = jax.lax.cond(~same_car, _write_ghosts, _skip_ghosts, None)
+         g_threshold, g_write_idx) = jax.lax.cond(~same_car, _write_ghosts, _skip_ghosts, None)
 
         key, event_key = jax.random.split(state.key)
         next_event = rs.get_random_event(event_key, params.events, state.event.t)
@@ -664,6 +748,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             ghost_active=g_active,
             ghost_excluded_cars=g_excluded_cars,
             ghost_n_excluded=g_n_excluded,
+            ghost_threshold=g_threshold,
             ghost_write_idx=g_write_idx,
         )
         done = self.is_terminal(next_state, params)
@@ -688,6 +773,8 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
                 "utilization": utilization,
                 "pct_cars_on_trip": pct_cars_on_trip,
                 "t": state.event.t,
+                "action_A": canonical_car,
+                "action_B": counterfactual_car,
                 **ghost_info,
             },
         )
@@ -695,7 +782,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         return jax.lax.cond(
             is_feasible,
             lambda: results,
-            lambda: self.step_env_unfulfill(key, state, action, params),
+            lambda: self.step_env_unfulfill(key, state, params),
         )
 
     def reset_env(
@@ -724,6 +811,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
                 (params.max_ghosts, params.max_exclusions), -1, dtype=int,
             ),
             ghost_n_excluded=jnp.zeros(params.max_ghosts, dtype=int),
+            ghost_threshold=jnp.zeros(params.max_ghosts, dtype=jnp.float32),
             ghost_write_idx=jnp.array(0, dtype=int),
         )
         return self.get_obs(state), state
@@ -795,9 +883,9 @@ class GreedyPolicy(rs.GreedyPolicy):
             return is_solo, marginal_cost, is_feasible
 
         is_solo, costs, is_feasible = jax.vmap(get_car_cost)(waypoints, times)
-        maxint = jnp.iinfo(costs.dtype).max
-        min_solo_cost = jnp.min(jnp.where(is_solo, costs, maxint))
-        min_pool_cost = jnp.min(jnp.where(~is_solo, costs, maxint))
+        # Use direct pickup-to-dropoff distance as the solo baseline.
+        # This is independent of which solo cars happen to be available.
+        min_solo_cost = env_params.distances[event.src, event.dest]
 
         # Check for eligibility based on savings threshold
         is_eligible = jnp.logical_or(
@@ -816,63 +904,14 @@ class GreedyPolicy(rs.GreedyPolicy):
         obs: Integer[Array, "o_dim"],
         rng: chex.PRNGKey,
     ):
-        event, waypoints, times = obs_to_state(
-            self.n_cars, _num_wp(env_params.max_active_trips), obs
-        )
-        rng, cost_rng = jax.random.split(rng)
-        costs, is_feasible = self.get_costs(
-            env_params, cost_rng, event, waypoints, times, nn_params
-        )
+        """Return [savings_threshold, savings_threshold] for both treatment arms.
 
-        # Assume positive part of reward is constant, so ignore
-        rewards = -costs
-        maxint = jnp.iinfo(costs.dtype).max
-
-        rng, rng2 = jax.random.split(rng)
-        best_action = jax.random.choice(
-            rng,
-            jnp.arange(self.n_cars),
-            p=jax.nn.softmax(
-                (rewards - jnp.max(rewards)) / self.temperature,
-                where=is_feasible,
-            ),
-        )
-
-        # Second best: mask out best, pick from remaining feasible
-        costs_without_best = costs.at[best_action].set(maxint)
-        is_feasible_without_best = is_feasible.at[best_action].set(False)
-        rewards2 = -costs_without_best
-        second_best = jax.lax.cond(
-            jnp.any(is_feasible_without_best),
-            lambda: jax.random.choice(
-                rng2,
-                jnp.arange(self.n_cars),
-                p=jax.nn.softmax(
-                    (rewards2 - jnp.max(rewards2)) / self.temperature,
-                    where=is_feasible_without_best,
-                ),
-            ),
-            lambda: best_action,  # fallback: same car
-        )
-
-        canonical = jax.lax.cond(
-            jnp.any(is_feasible),
-            lambda: best_action,
-            lambda: jnp.array(-1, dtype=best_action.dtype),
-        )
-        counterfactual = jax.lax.cond(
-            jnp.any(is_feasible),
-            lambda: second_best,
-            lambda: jnp.array(-1, dtype=best_action.dtype),
-        )
-
-        action = jnp.array([canonical, counterfactual])
-
-        info = {
-            "best_cost": -rewards[best_action],
-        }
-
-        return action, info
+        The environment uses these thresholds to select canonical and counterfactual
+        cars internally via greedy_select_car.
+        """
+        threshold = jnp.array(self.savings_threshold, dtype=jnp.float32)
+        action = jnp.array([threshold, threshold])
+        return action, {}
 
 
 if __name__ == "__main__":

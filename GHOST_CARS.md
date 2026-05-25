@@ -44,7 +44,7 @@ Within each step, trigger detection runs *before* expiry. A ghost that expires a
 
 ## State additions
 
-`EnvState` gained 9 fields:
+`EnvState` gained 10 fields:
 
 ```python
 ghost_waypoints: Integer[Array, "max_ghosts max_waypoints"]
@@ -55,6 +55,7 @@ ghost_type: Integer[Array, "max_ghosts"]        # 0=A, 1=B
 ghost_active: Bool[Array, "max_ghosts"]
 ghost_excluded_cars: Integer[Array, "max_ghosts max_exclusions"]
 ghost_n_excluded: Integer[Array, "max_ghosts"]
+ghost_threshold: Float[Array, "max_ghosts"]     # savings threshold per ghost
 ghost_write_idx: Integer[Array, ""]              # ring buffer pointer
 ```
 
@@ -66,18 +67,31 @@ ghost_max_lifespan: int = 50         # steps before expiry
 ghost_max_branch_depth: int = 0      # 0 = no branching (not yet implemented)
 ```
 
-## Action interface change
+## Action interface
 
-The action changed from a scalar (car index) to `Integer[Array, "2"]` = `[canonical_car, counterfactual_car]`. Use `action[0] < 0` to signal unfulfill.
+The action is `Float[Array, "2"]` = `[savings_threshold_A, savings_threshold_B]`.
 
-`GreedyPolicy.apply` now returns a `(2,)` array: the best and second-best car.
+- `threshold_A`: the canonical (treatment A) policy's savings threshold
+- `threshold_B`: the counterfactual (treatment B) policy's savings threshold
 
-The `xp_gym` `XPEnvironment` wrapper composes the action pair from the two policies' outputs based on the treatment assignment.
+The environment internally selects cars using a deterministic greedy policy (`greedy_select_car`):
+1. Canonical car = cheapest eligible car under `threshold_A`
+2. Counterfactual car = cheapest eligible car under `threshold_B`, excluding canonical
+
+A car is **eligible** if it is solo (no active trips) or its marginal cost is below `direct_cost × (1 − threshold)`, where `direct_cost = distances[src, dest]` (the direct pickup-to-dropoff distance). This is the sole baseline for the savings threshold — independent of which solo cars happen to be available.
+
+If no canonical car is eligible, the step unfulfills. If no counterfactual car is found, it falls back to canonical (triggering the same-car skip).
+
+`GreedyPolicy.apply` returns `[savings_threshold, savings_threshold]` — the policy's threshold for both arms. Car selection happens inside the environment.
+
+The chosen car indices are logged as `action_A` and `action_B` in the info dict.
 
 ## Info dict additions
 
-Each step returns these ghost-related keys in `info`:
+Each step returns these keys in `info`:
 
+- `action_A`: scalar int32 — canonical car index chosen (-1 on unfulfill)
+- `action_B`: scalar int32 — counterfactual car index chosen (-1 on unfulfill)
 - `ghost_triggered`: `Bool[max_ghosts]` — which ghosts triggered (ghost wins OR canonical wins)
 - `ghost_trigger_origin_steps`: `Integer[max_ghosts]` — origin step of each triggered ghost (-1 if not triggered)
 - `n_ghost_triggers`: scalar — total number of triggers this step
