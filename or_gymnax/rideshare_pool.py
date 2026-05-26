@@ -557,9 +557,10 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         threshold_B). Dispatches the canonical car if found, otherwise unfulfills.
 
         Ghost creation is symmetric and independent:
-          Ghost A is written iff A dispatches (canonical_found).
-          Ghost B is written iff B would dispatch (cf_found).
-          Both policies select independently; they may choose the same car.
+          Ghost A is written iff A dispatches AND cf != canonical.
+          Ghost B is written iff B would dispatch AND cf != canonical.
+          When both policies choose the same car there is no counterfactual
+          to track, so no ghosts are written.
         """
         threshold_a = action[0].astype(jnp.float32)
         threshold_b = action[1].astype(jnp.float32)
@@ -581,9 +582,11 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             lambda: self.step_env_unfulfill(key, state, params),
         )
 
-        # Ghost A: canonical car pre-dispatch. Written iff A dispatched.
+        different_cars = canonical_car != cf_car
+
+        # Ghost A: canonical car pre-dispatch. Written iff A dispatched and cars differ.
         next_state = jax.lax.cond(
-            canonical_found,
+            canonical_found & different_cars,
             lambda ns: apply_ghost_a(
                 state, ns, canonical_car, threshold_a,
                 params.max_exclusions, params.max_ghosts,
@@ -592,9 +595,9 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             next_state,
         )
 
-        # Ghost B: cf car with trip inserted. Written iff B found.
+        # Ghost B: cf car with trip inserted. Written iff B found and cars differ.
         next_state = jax.lax.cond(
-            cf_found,
+            cf_found & different_cars,
             lambda ns: apply_ghost_b(
                 state, ns, cf_car, threshold_b, params.distances,
                 params.max_active_trips, params.max_exclusions, params.max_ghosts,

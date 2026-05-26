@@ -51,8 +51,12 @@ ENV_PARAMS = EnvParams(
 )
 
 # Threshold=0.0: solo cars always eligible; pool cars eligible if marginal cost
-# < direct_cost (which is almost always true for pooling). Deterministic argmin.
+# < direct_cost. Equal thresholds always pick the same car → no ghosts.
 _THRESH = jnp.array([0.0, 0.0])
+
+# _MIXED_THRESH with _make_mixed_state: A picks car 1 (cheap pool), B picks car 0 (solo).
+# Guaranteed different cars → both ghosts written.
+_MIXED_THRESH = jnp.array([0.0, 1.0])
 
 
 def test_basic_step_runs():
@@ -68,10 +72,12 @@ def test_basic_step_runs():
 
 
 def test_ghosts_created_on_dispatch():
-    """After one dispatch step, exactly 2 ghosts should be active."""
+    """After one dispatch step with different cars, exactly 2 ghosts should be active."""
     key = jax.random.PRNGKey(0)
-    obs, state = ENV.reset(key, ENV_PARAMS)
-    _, state2, _, _, info = ENV.step(key, state, _THRESH, ENV_PARAMS)
+    _, base = ENV.reset_env(key, ENV_PARAMS)
+    state = _make_mixed_state(base)
+    _, state2, _, _, info = ENV.step_env(key, state, _MIXED_THRESH, ENV_PARAMS)
+    assert int(info["action_A"]) != int(info["action_B"]), "cars must differ for ghosts"
     n_active = jnp.sum(state2.ghost_active)
     assert n_active == 2, f"Expected 2 active ghosts, got {n_active}"
     active_types = state2.ghost_type[state2.ghost_active]
@@ -82,8 +88,9 @@ def test_ghosts_created_on_dispatch():
 def test_ghost_a_is_pre_dispatch_snapshot():
     """Ghost A (type 0) should have the canonical car's pre-dispatch state."""
     key = jax.random.PRNGKey(0)
-    obs, state = ENV.reset(key, ENV_PARAMS)
-    _, state2, _, _, info = ENV.step(key, state, _THRESH, ENV_PARAMS)
+    _, base = ENV.reset_env(key, ENV_PARAMS)
+    state = _make_mixed_state(base)
+    _, state2, _, _, info = ENV.step_env(key, state, _MIXED_THRESH, ENV_PARAMS)
     canonical_car = int(info["action_A"])
     ghost_idx = jnp.argmax(state2.ghost_active & (state2.ghost_type == 0))
     assert jnp.array_equal(state2.ghost_waypoints[ghost_idx], state.waypoints[canonical_car])
@@ -93,8 +100,9 @@ def test_ghost_a_is_pre_dispatch_snapshot():
 def test_ghost_b_is_counterfactual_dispatch():
     """Ghost B (type 1) should have the counterfactual car with the trip added."""
     key = jax.random.PRNGKey(0)
-    obs, state = ENV.reset(key, ENV_PARAMS)
-    _, state2, _, _, info = ENV.step(key, state, _THRESH, ENV_PARAMS)
+    _, base = ENV.reset_env(key, ENV_PARAMS)
+    state = _make_mixed_state(base)
+    _, state2, _, _, info = ENV.step_env(key, state, _MIXED_THRESH, ENV_PARAMS)
     cf_car = int(info["action_B"])
     expected_wp, expected_t, _, _ = insert_and_optimize_trip(
         ENV_PARAMS.distances,
@@ -111,16 +119,21 @@ def test_ring_buffer_wraps():
     """When buffer fills, ring buffer should overwrite oldest slots."""
     ep = ENV_PARAMS.replace(max_ghosts=4, ghost_max_lifespan=100)
     key = jax.random.PRNGKey(0)
-    _, state = ENV.reset_env(key, ep)
+    _, base = ENV.reset_env(key, ep)
+
+    # Reset to mixed_state before each step so both policies always dispatch
+    # different cars (car 1 vs car 0), yielding exactly 2 ghost writes per step.
     key, sk = jax.random.split(key)
-    _, s1, _, _, _ = ENV.step_env(sk, state, _THRESH, ep)
+    _, s1, _, _, _ = ENV.step_env(sk, _make_mixed_state(base), _MIXED_THRESH, ep)
     assert jnp.sum(s1.ghost_active) == 2
+
     key, sk = jax.random.split(key)
-    _, s2, _, _, _ = ENV.step_env(sk, s1, _THRESH, ep)
+    _, s2, _, _, _ = ENV.step_env(sk, _make_mixed_state(s1), _MIXED_THRESH, ep)
     assert jnp.sum(s2.ghost_active) == 4
+
     # 3rd step wraps — should overwrite slots 0,1
     key, sk = jax.random.split(key)
-    _, s3, _, _, _ = ENV.step_env(sk, s2, _THRESH, ep)
+    _, s3, _, _, _ = ENV.step_env(sk, _make_mixed_state(s2), _MIXED_THRESH, ep)
     assert s3.ghost_origin_step[0] == s2.time
     assert s3.ghost_origin_step[1] == s2.time
 
@@ -166,18 +179,19 @@ def test_oracle_forked_simulation():
     """
     Oracle test: fork at step t, independently track the counterfactual car's
     evolving state, and verify ghost trigger pattern matches.
+
+    Fork threshold [1.0, 0.0]: A picks car 0 (solo), B picks car 1 (cheap pool).
+    Ghost B = car 1 with trip, threshold=0.0 (cheap-pool eligible → likely triggers).
     """
     key = jax.random.PRNGKey(7)
     ep = ENV_PARAMS.replace(ghost_max_lifespan=20, max_ghosts=64)
-    obs, state = ENV.reset_env(key, ep)
+    _, base = ENV.reset_env(key, ep)
 
-    # Setup step
+    # Fork point: use mixed_state so both policies dispatch different cars
+    fork_thresh = jnp.array([1.0, 0.0])  # A=car0 (solo), B=car1 (cheap pool)
+    state = _make_mixed_state(base)
     key, sk = jax.random.split(key)
-    _, state, _, _, _ = ENV.step_env(sk, state, _THRESH, ep)
-
-    # Fork point: let the env choose cars, then read which were chosen
-    key, sk = jax.random.split(key)
-    _, real_state, _, _, fork_info = ENV.step_env(sk, state, _THRESH, ep)
+    _, real_state, _, _, fork_info = ENV.step_env(sk, state, fork_thresh, ep)
     canonical_car = int(fork_info["action_A"])
     cf_car = int(fork_info["action_B"])
 
@@ -215,10 +229,11 @@ def test_oracle_forked_simulation():
         _, real_s, _, _, info = ENV.step_env(sk, real_s, _THRESH, ep)
         tracker_triggered = bool(info["ghost_triggered"][ghost_type1_idx])
 
-        # Expire after trigger check (matches tracker behaviour)
+        # Expire after trigger check (matches tracker: trigger uses prev-step active state)
+        oracle_was_active = oracle_active
         if int(event.t) - ghost_birth_time >= ep.ghost_max_lifespan:
             oracle_active = False
-        oracle_triggered = oracle_triggered and oracle_active
+        oracle_triggered = oracle_triggered and oracle_was_active
 
         assert oracle_triggered == tracker_triggered, (
             f"Step t+{i+1}: oracle={oracle_triggered}, tracker={tracker_triggered}"
@@ -228,8 +243,9 @@ def test_oracle_forked_simulation():
 def test_exclusion_prevents_self_comparison():
     """A ghost forked from car C should exclude car C from comparison."""
     key = jax.random.PRNGKey(0)
-    obs, state = ENV.reset(key, ENV_PARAMS)
-    _, state2, _, _, info = ENV.step(key, state, _THRESH, ENV_PARAMS)
+    _, base = ENV.reset_env(key, ENV_PARAMS)
+    state = _make_mixed_state(base)
+    _, state2, _, _, info = ENV.step_env(key, state, _MIXED_THRESH, ENV_PARAMS)
     canonical_car = int(info["action_A"])
     cf_car = int(info["action_B"])
     excl = set()
@@ -243,14 +259,14 @@ def test_exclusion_prevents_self_comparison():
 Ghost creation 2x2 desired outcomes
 ====================================
 
-Both policies select independently from the full fleet. They may pick the
-same car (action_A == action_B), which is a valid case meaning both policies
-agree.
+Both policies select independently. No ghosts when action_A == action_B
+(same car means no counterfactual to track). Otherwise, when cars differ:
 
-  A fulfills, B fulfills  →  Ghost A (type 0) + Ghost B (type 1), write_idx +2
-  A fulfills, B unfulfills →  Ghost A only (type 0),               write_idx +1
-  A unfulfills, B fulfills →  Ghost B only (type 1),               write_idx +1
-  A unfulfills, B unfulfills → no ghosts,                          write_idx +0
+  A fulfills, B fulfills, A≠B  →  Ghost A (type 0) + Ghost B (type 1), write_idx +2
+  A fulfills, B unfulfills     →  Ghost A only (type 0),                write_idx +1
+  A unfulfills, B fulfills     →  Ghost B only (type 1),                write_idx +1
+  A unfulfills, B unfulfills   →  no ghosts,                            write_idx +0
+  A == B (same car)            →  no ghosts,                            write_idx +0
 
   action_A = canonical car index, or -1 if A unfulfills
   action_B = cf car index,        or -1 if B unfulfills
@@ -307,31 +323,68 @@ def _make_cheap_pool_state(base_state):
     return base_state.replace(times=times, waypoints=waypoints, event=event)
 
 
+def _make_mixed_state(base_state):
+    """Car 0 solo; cars 1,2 busy (cheap to pool). Event: src=1, dest=4, t=0.
+    Costs: car 0 solo (cost=8), cars 1,2 busy (cost=0 < 6 = direct).
+      threshold=0.0 → A picks car 1 (cost=0, cheapest overall).
+      threshold=1.0 → B picks car 0 (only solo).
+    Use _MIXED_THRESH=[0.0, 1.0] to get both policies dispatching different cars.
+    """
+    max_wp = _num_wp(ENV_PARAMS.max_active_trips)
+    event = rs.RideshareEvent(
+        t=jnp.array(0, dtype=jnp.int32),
+        src=jnp.array(1, dtype=jnp.int32),
+        dest=jnp.array(4, dtype=jnp.int32),
+    )
+    # car 0 solo (times=0), cars 1,2 busy (deadline=8, cost=0 for this event)
+    times = jnp.zeros((_N_CARS, max_wp), dtype=jnp.int32).at[1, 0].set(8).at[2, 0].set(8)
+    waypoints = jnp.zeros((_N_CARS, max_wp), dtype=jnp.int32)
+    return base_state.replace(times=times, waypoints=waypoints, event=event)
+
+
 # ---------------------------------------------------------------------------
 # 2x2 ghost creation cases
 # ---------------------------------------------------------------------------
 
 def test_both_fulfill_two_ghosts():
     """
-    A fulfills, B fulfills → Ghost A + Ghost B, write_idx +2.
+    A fulfills, B fulfills, different cars → Ghost A + Ghost B, write_idx +2.
 
-    With threshold=[0.0, 0.0] and all-solo cars, both policies pick the same
-    cheapest car. Ghost A = that car pre-dispatch; Ghost B = that car with trip.
+    Use _make_mixed_state + [0.0, 1.0]: A picks car 1 (cheap pool), B picks car 0 (solo).
+    Same car would produce no ghosts; different cars produce both.
     """
     key = jax.random.PRNGKey(0)
-    _, state = ENV.reset_env(key, ENV_PARAMS)  # all cars solo
+    _, base = ENV.reset_env(key, ENV_PARAMS)
+    state = _make_mixed_state(base)
 
-    _, state2, _, _, info = ENV.step_env(key, state, jnp.array([0.0, 0.0]), ENV_PARAMS)
+    _, state2, _, _, info = ENV.step_env(key, state, _MIXED_THRESH, ENV_PARAMS)
 
     assert not bool(info["is_unfulfill"]), "A should have dispatched"
     assert int(info["action_A"]) >= 0
     assert int(info["action_B"]) >= 0
+    assert int(info["action_A"]) != int(info["action_B"]), "must be different cars"
     assert int(jnp.sum(state2.ghost_active)) == 2, \
         f"Expected 2 active ghosts, got {jnp.sum(state2.ghost_active)}"
     active_types = state2.ghost_type[state2.ghost_active]
     assert int(jnp.sum(active_types == 0)) == 1, "Expected 1 Ghost A"
     assert int(jnp.sum(active_types == 1)) == 1, "Expected 1 Ghost B"
     assert int(state2.ghost_write_idx) == int(state.ghost_write_idx) + 2
+
+
+def test_same_car_no_ghosts():
+    """
+    A == B (same car) → no ghosts, write_idx unchanged.
+
+    Equal thresholds on same fleet → same argmin → no counterfactual.
+    """
+    key = jax.random.PRNGKey(0)
+    _, base = ENV.reset_env(key, ENV_PARAMS)
+    # fresh reset, all solos, equal thresholds → same cheapest car selected by both
+    _, state2, _, _, info = ENV.step_env(key, base, jnp.array([0.0, 0.0]), ENV_PARAMS)
+
+    assert int(info["action_A"]) == int(info["action_B"]), "same car expected"
+    assert int(jnp.sum(state2.ghost_active)) == 0, "no ghosts when same car"
+    assert int(state2.ghost_write_idx) == int(base.ghost_write_idx)
 
 
 def test_a_fulfills_b_unfulfills_ghost_a_only():
@@ -415,7 +468,7 @@ def test_ghost_a_content_when_b_unfulfills():
     """Ghost A content matches canonical car's pre-dispatch state."""
     key = jax.random.PRNGKey(0)
     _, base = ENV.reset_env(key, ENV_PARAMS)
-    state = _make_one_solo_state(base)
+    state = _make_cheap_pool_state(base)  # all busy: A dispatches, B (threshold=1.0) unfulfills
     action = jnp.array([0.0, _HIGH_THRESH])
 
     _, state2, _, _, info = ENV.step_env(key, state, action, ENV_PARAMS)
@@ -460,12 +513,11 @@ def test_ghost_buffer_advances_correctly():
     _, base = ENV.reset_env(key, ep)
 
     cheap_pool = _make_cheap_pool_state(base)  # all busy, car 0 cheap to pool
-    all_solo = base  # fresh reset: all solo
 
     start_idx = int(base.ghost_write_idx)  # 0
 
-    # Both fulfill: +2 (all solo, both pick same cheapest car)
-    _, s1, _, _, _ = ENV.step_env(key, all_solo, jnp.array([0.0, 0.0]), ep)
+    # Both fulfill, different cars: +2 (mixed state: A→car1, B→car0)
+    _, s1, _, _, _ = ENV.step_env(key, _make_mixed_state(base), _MIXED_THRESH, ep)
     assert int(s1.ghost_write_idx) == start_idx + 2
 
     # A fulfills, B unfulfills: +1 (car 0 poolable; threshold_b=1.0 needs solo → none)
