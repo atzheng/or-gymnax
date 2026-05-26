@@ -472,19 +472,16 @@ def greedy_select_car(
     event: rs.RideshareEvent,
     max_active_trips: int,
     savings_threshold: float,
-    exclude_car: Integer[Array, ""] = jnp.array(-1, dtype=jnp.int32),
 ) -> Tuple[Integer[Array, ""], Bool[Array, ""]]:
     """Select the cheapest eligible car under the savings threshold.
 
     A car is eligible if it is solo (no active trips) or its marginal cost
     is below direct_cost * (1 - savings_threshold), where direct_cost is
-    the pickup-to-dropoff distance. Car exclude_car is always ineligible
-    (use -1 to exclude nothing).
+    the pickup-to-dropoff distance.
 
     Returns (car_idx, found); car_idx is valid only when found=True.
     """
     direct_cost = distances[event.src, event.dest]
-    car_indices = jnp.arange(waypoints.shape[0], dtype=jnp.int32)
 
     def cost_one(car_wp, car_t):
         is_solo = jnp.all(car_t <= event.t)
@@ -496,8 +493,6 @@ def greedy_select_car(
         return cost, eligible
 
     costs, eligible = jax.vmap(cost_one)(waypoints, times)
-    eligible = eligible & (car_indices != exclude_car)
-
     maxint = jnp.iinfo(costs.dtype).max
     masked_costs = jnp.where(eligible, costs, maxint)
     car_idx = jnp.argmin(masked_costs)
@@ -562,8 +557,9 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         threshold_B). Dispatches the canonical car if found, otherwise unfulfills.
 
         Ghost creation is symmetric and independent:
-          Ghost A is written iff A dispatches (canonical_found and feasible).
-          Ghost B is written iff B would dispatch (cf_found) and cf != canonical.
+          Ghost A is written iff A dispatches (canonical_found).
+          Ghost B is written iff B would dispatch (cf_found).
+          Both policies select independently; they may choose the same car.
         """
         threshold_a = action[0].astype(jnp.float32)
         threshold_b = action[1].astype(jnp.float32)
@@ -573,11 +569,9 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             params.max_active_trips, threshold_a,
         )
         canonical_car = jnp.where(canonical_found, canonical_car, jnp.array(-1, dtype=jnp.int32))
-        # cf search excludes canonical_car so the two arms always select different cars.
-        # When canonical_car=-1 (A unfulfills), exclude_car=-1 excludes nothing.
         cf_car, cf_found = greedy_select_car(
             params.distances, state.waypoints, state.times, state.event,
-            params.max_active_trips, threshold_b, exclude_car=canonical_car,
+            params.max_active_trips, threshold_b,
         )
         cf_car = jnp.where(cf_found, cf_car, jnp.array(-1, dtype=jnp.int32))
 

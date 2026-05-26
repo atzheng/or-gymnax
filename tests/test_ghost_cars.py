@@ -243,8 +243,9 @@ def test_exclusion_prevents_self_comparison():
 Ghost creation 2x2 desired outcomes
 ====================================
 
-The cf search always excludes canonical_car, so both arms always select
-different cars when eligible. There is no "same-car" case.
+Both policies select independently from the full fleet. They may pick the
+same car (action_A == action_B), which is a valid case meaning both policies
+agree.
 
   A fulfills, B fulfills  →  Ghost A (type 0) + Ghost B (type 1), write_idx +2
   A fulfills, B unfulfills →  Ghost A only (type 0),               write_idx +1
@@ -283,6 +284,29 @@ def _make_one_solo_state(base_state):
     return base_state.replace(times=times)
 
 
+def _make_cheap_pool_state(base_state):
+    """All 3 cars busy (no solos), eligible for threshold=0.0 but NOT threshold=1.0.
+    Event overridden to src=1, dest=4 (direct_cost=dist(1,4)=6, t=0).
+
+    Cost semantics in this env: marginal_cost = new_max_completion_time - old_max_completion_time.
+    With event src=1, dest=4:
+      Cars 1,2: waypoint→node 0, deadline=8. cost=0 (< 6, >=0).
+        elig thresh=0.0: 0 < 6 ✓; elig thresh=1.0: 0 < 0 ✗.
+      Car 0: waypoint→node 4, deadline=20. cost=2 (< 6, > 0).
+        elig thresh=0.0: 2 < 6 ✓; elig thresh=1.0: 2 < 0 ✗.
+    """
+    max_wp = _num_wp(ENV_PARAMS.max_active_trips)
+    event = rs.RideshareEvent(
+        t=jnp.array(0, dtype=jnp.int32),
+        src=jnp.array(1, dtype=jnp.int32),
+        dest=jnp.array(4, dtype=jnp.int32),
+    )
+    # car 0 → node 4 (deadline=20), cars 1,2 → node 0 (deadline=8)
+    times = jnp.zeros((_N_CARS, max_wp), dtype=jnp.int32).at[0, 0].set(20).at[1, 0].set(8).at[2, 0].set(8)
+    waypoints = jnp.zeros((_N_CARS, max_wp), dtype=jnp.int32).at[0, 0].set(4)
+    return base_state.replace(times=times, waypoints=waypoints, event=event)
+
+
 # ---------------------------------------------------------------------------
 # 2x2 ghost creation cases
 # ---------------------------------------------------------------------------
@@ -291,8 +315,8 @@ def test_both_fulfill_two_ghosts():
     """
     A fulfills, B fulfills → Ghost A + Ghost B, write_idx +2.
 
-    With threshold=[0.0, 0.0] and all-solo cars, A takes the cheapest car and
-    B (which excludes canonical) takes the second cheapest. Two different cars.
+    With threshold=[0.0, 0.0] and all-solo cars, both policies pick the same
+    cheapest car. Ghost A = that car pre-dispatch; Ghost B = that car with trip.
     """
     key = jax.random.PRNGKey(0)
     _, state = ENV.reset_env(key, ENV_PARAMS)  # all cars solo
@@ -302,7 +326,6 @@ def test_both_fulfill_two_ghosts():
     assert not bool(info["is_unfulfill"]), "A should have dispatched"
     assert int(info["action_A"]) >= 0
     assert int(info["action_B"]) >= 0
-    assert int(info["action_A"]) != int(info["action_B"]), "should be different cars"
     assert int(jnp.sum(state2.ghost_active)) == 2, \
         f"Expected 2 active ghosts, got {jnp.sum(state2.ghost_active)}"
     active_types = state2.ghost_type[state2.ghost_active]
@@ -315,13 +338,13 @@ def test_a_fulfills_b_unfulfills_ghost_a_only():
     """
     A fulfills, B unfulfills → Ghost A only (type 0), write_idx +1, action_B=-1.
 
-    State: car 0 solo, cars 1+2 busy.
-    threshold_a=0.0 → A picks car 0 (solo, cheapest/only eligible).
-    threshold_b=1.0 → B: only solos eligible; car 0 is excluded; cars 1,2 busy → B unfulfills.
+    State: all cars busy (no solos), car 0 cheap to pool.
+    threshold_a=0.0 → A: car 0 eligible (cheap pool) → A dispatches.
+    threshold_b=1.0 → B: only solos eligible; none available → B unfulfills.
     """
     key = jax.random.PRNGKey(0)
     _, base = ENV.reset_env(key, ENV_PARAMS)
-    state = _make_one_solo_state(base)
+    state = _make_cheap_pool_state(base)
     action = jnp.array([0.0, _HIGH_THRESH])
 
     _, state2, _, _, info = ENV.step_env(key, state, action, ENV_PARAMS)
@@ -340,13 +363,13 @@ def test_a_unfulfills_b_fulfills_ghost_b_only():
     """
     A unfulfills, B fulfills → Ghost B only (type 1), write_idx +1, action_A=-1.
 
-    State: all cars busy.
+    State: all cars busy, car 0 cheap to pool.
     threshold_a=1.0 → A: only solos eligible; none → A unfulfills (canonical_car=-1).
-    threshold_b=0.0 → B: pooling OK, exclude_car=-1 → picks cheapest poolable car.
+    threshold_b=0.0 → B: car 0 eligible (cheap pool) → B dispatches.
     """
     key = jax.random.PRNGKey(0)
     _, base = ENV.reset_env(key, ENV_PARAMS)
-    state = _make_busy_state(base)
+    state = _make_cheap_pool_state(base)
     action = jnp.array([_HIGH_THRESH, 0.0])
 
     _, state2, _, _, info = ENV.step_env(key, state, action, ENV_PARAMS)
@@ -408,7 +431,7 @@ def test_ghost_b_content_when_a_unfulfills():
     """Ghost B content matches cf car with trip inserted."""
     key = jax.random.PRNGKey(0)
     _, base = ENV.reset_env(key, ENV_PARAMS)
-    state = _make_busy_state(base)
+    state = _make_cheap_pool_state(base)
     action = jnp.array([_HIGH_THRESH, 0.0])
 
     _, state2, _, _, info = ENV.step_env(key, state, action, ENV_PARAMS)
@@ -436,26 +459,25 @@ def test_ghost_buffer_advances_correctly():
     key = jax.random.PRNGKey(0)
     _, base = ENV.reset_env(key, ep)
 
-    busy = _make_busy_state(base)
-    solo = _make_one_solo_state(base)
+    cheap_pool = _make_cheap_pool_state(base)  # all busy, car 0 cheap to pool
     all_solo = base  # fresh reset: all solo
 
     start_idx = int(base.ghost_write_idx)  # 0
 
-    # Both fulfill: +2
+    # Both fulfill: +2 (all solo, both pick same cheapest car)
     _, s1, _, _, _ = ENV.step_env(key, all_solo, jnp.array([0.0, 0.0]), ep)
     assert int(s1.ghost_write_idx) == start_idx + 2
 
-    # A fulfills, B unfulfills: +1
-    _, s2, _, _, _ = ENV.step_env(key, solo, jnp.array([0.0, _HIGH_THRESH]), ep)
+    # A fulfills, B unfulfills: +1 (car 0 poolable; threshold_b=1.0 needs solo → none)
+    _, s2, _, _, _ = ENV.step_env(key, cheap_pool, jnp.array([0.0, _HIGH_THRESH]), ep)
     assert int(s2.ghost_write_idx) == start_idx + 1
 
-    # A unfulfills, B fulfills: +1
-    _, s3, _, _, _ = ENV.step_env(key, busy, jnp.array([_HIGH_THRESH, 0.0]), ep)
+    # A unfulfills, B fulfills: +1 (threshold_a=1.0 needs solo → none; car 0 poolable for B)
+    _, s3, _, _, _ = ENV.step_env(key, cheap_pool, jnp.array([_HIGH_THRESH, 0.0]), ep)
     assert int(s3.ghost_write_idx) == start_idx + 1
 
-    # Both unfulfill: +0
-    _, s4, _, _, _ = ENV.step_env(key, busy, jnp.array([_HIGH_THRESH, _HIGH_THRESH]), ep)
+    # Both unfulfill: +0 (all busy, both need solo → none)
+    _, s4, _, _, _ = ENV.step_env(key, cheap_pool, jnp.array([_HIGH_THRESH, _HIGH_THRESH]), ep)
     assert int(s4.ghost_write_idx) == start_idx + 0
 
 

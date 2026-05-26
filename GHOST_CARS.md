@@ -41,7 +41,7 @@ Ghost creation is symmetric and independent: Ghost A is written iff A fulfills; 
 | unfulfills | fulfills | Ghost B only | +1 |
 | unfulfills | unfulfills | none | 0 |
 
-Because the cf search always excludes the canonical car, the two arms always select different cars when both find one — there is no "same-car" case to skip.
+Both policies select independently from the full fleet and may choose the same car (action_A == action_B). Ghost A and Ghost B are written independently based solely on whether each policy dispatches. At future timesteps, each ghost excludes its corresponding real car (via `ghost_excluded_cars`) when making dispatch decisions.
 
 Ghost A = canonical car's state **before** dispatch ("what if A hadn't dispatched?").
 Ghost B = counterfactual car's state **with** the trip inserted ("what if B had dispatched?").
@@ -136,9 +136,11 @@ All in `or_gymnax/rideshare_pool.py`:
 7. **Exclusion sets** — correct car indices in exclusion lists
 8. **JIT + scan compatibility** — works under `jax.jit` and `jax.lax.scan`
 9. **Policy action shape** — `GreedyPolicy` returns `(2,)` action
-10. **No ghost when same car** — no ghosts created and `ghost_write_idx` unchanged when canonical == counterfactual
-11. **Buffer position after skip** — `ghost_write_idx` and `ghost_origin_step` are correct for ghosts created immediately after a same-car skip
-12. **Oracle after same-car skip** — oracle test verifying that ghost pairs created after a skip produce correct trigger patterns and origin-step reporting over 6 future steps
+10. **Both fulfill, two ghosts** — two ghosts written when both policies dispatch
+11. **A fulfills, B unfulfills** — only Ghost A written
+12. **A unfulfills, B fulfills** — only Ghost B written
+13. **Both unfulfill, no ghosts** — buffer unchanged
+14. **Same-car case** — both policies may select the same car; ghost A and B still written independently
 
 Run with: `python -m pytest tests/test_ghost_cars.py -p no:logfire`
 
