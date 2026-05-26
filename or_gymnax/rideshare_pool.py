@@ -395,64 +395,57 @@ def update_triggered_ghosts(
     return new_ghost_wps, new_ghost_ts
 
 
-def create_ghost_pair(
-    distances, state, canonical_car, counterfactual_car, event,
-    max_active_trips, max_exclusions, threshold_a, threshold_b,
-):
+def apply_ghost_a(pre_state, next_state, canonical_car, threshold_a, max_exclusions, max_ghosts):
+    """Write Ghost A (canonical car pre-dispatch) into next_state's ghost buffer.
+
+    Ghost A represents the canonical car's state had it NOT been dispatched.
+    pre_state supplies the car's waypoints and the origin step; next_state supplies
+    the ghost buffer fields (already updated by trigger/expiry) and the write index.
     """
-    Create two ghost cars:
-      Ghost A: canonical car's current state (WITHOUT the new trip)
-      Ghost B: counterfactual car's state WITH the trip added
-    Returns waypoints, times, types, exclusion arrays, and per-ghost thresholds.
-    """
-    # Ghost A: snapshot of canonical car pre-dispatch
-    ghost_a_wp = state.waypoints[canonical_car]
-    ghost_a_t = state.times[canonical_car]
-
-    # Ghost B: counterfactual car with trip inserted
-    ghost_b_wp, ghost_b_t, _, _ = insert_and_optimize_trip(
-        distances,
-        state.waypoints[counterfactual_car],
-        state.times[counterfactual_car],
-        event.src, event.dest, event.t, max_active_trips,
-    )
-
-    # Exclusion lists: each ghost excludes the car it forked from
-    empty_exclusions = jnp.full(max_exclusions, -1, dtype=jnp.int32)
-    ghost_a_excluded = empty_exclusions.at[0].set(canonical_car)
-    ghost_b_excluded = empty_exclusions.at[0].set(counterfactual_car)
-
-    return (
-        jnp.stack([ghost_a_wp, ghost_b_wp]),                          # (2, max_waypoints)
-        jnp.stack([ghost_a_t, ghost_b_t]),                            # (2, max_waypoints)
-        jnp.array([0, 1], dtype=jnp.int32),                          # types
-        jnp.stack([ghost_a_excluded, ghost_b_excluded]),              # (2, max_exclusions)
-        jnp.array([1, 1], dtype=jnp.int32),                          # n_excluded
-        jnp.array([threshold_a, threshold_b], dtype=jnp.float32),    # thresholds
+    wp = pre_state.waypoints[canonical_car]
+    t = pre_state.times[canonical_car]
+    excluded = jnp.full(max_exclusions, -1, dtype=jnp.int32).at[0].set(canonical_car)
+    idx = next_state.ghost_write_idx % max_ghosts
+    return next_state.replace(
+        ghost_waypoints=next_state.ghost_waypoints.at[idx].set(wp),
+        ghost_times=next_state.ghost_times.at[idx].set(t),
+        ghost_birth_time=next_state.ghost_birth_time.at[idx].set(pre_state.event.t),
+        ghost_origin_step=next_state.ghost_origin_step.at[idx].set(pre_state.time),
+        ghost_type=next_state.ghost_type.at[idx].set(jnp.array(0, dtype=jnp.int32)),
+        ghost_active=next_state.ghost_active.at[idx].set(True),
+        ghost_excluded_cars=next_state.ghost_excluded_cars.at[idx].set(excluded),
+        ghost_n_excluded=next_state.ghost_n_excluded.at[idx].set(jnp.array(1, dtype=jnp.int32)),
+        ghost_threshold=next_state.ghost_threshold.at[idx].set(threshold_a),
+        ghost_write_idx=(next_state.ghost_write_idx + 1) % max_ghosts,
     )
 
 
-def write_ghosts_to_buffer(state, new_wps, new_ts, new_types,
-                           new_excluded, new_n_excluded, new_thresholds,
-                           current_time, max_ghosts):
-    """Write 2 new ghosts into the ring buffer at ghost_write_idx."""
-    idx0 = state.ghost_write_idx % max_ghosts
-    idx1 = (state.ghost_write_idx + 1) % max_ghosts
+def apply_ghost_b(pre_state, next_state, cf_car, threshold_b, distances,
+                  max_active_trips, max_exclusions, max_ghosts):
+    """Write Ghost B (cf car with trip inserted) into next_state's ghost buffer.
 
-    ghost_waypoints = state.ghost_waypoints.at[idx0].set(new_wps[0]).at[idx1].set(new_wps[1])
-    ghost_times = state.ghost_times.at[idx0].set(new_ts[0]).at[idx1].set(new_ts[1])
-    ghost_birth_time = state.ghost_birth_time.at[idx0].set(current_time).at[idx1].set(current_time)
-    ghost_origin_step = state.ghost_origin_step.at[idx0].set(state.time).at[idx1].set(state.time)
-    ghost_type = state.ghost_type.at[idx0].set(new_types[0]).at[idx1].set(new_types[1])
-    ghost_active = state.ghost_active.at[idx0].set(True).at[idx1].set(True)
-    ghost_excluded_cars = state.ghost_excluded_cars.at[idx0].set(new_excluded[0]).at[idx1].set(new_excluded[1])
-    ghost_n_excluded = state.ghost_n_excluded.at[idx0].set(new_n_excluded[0]).at[idx1].set(new_n_excluded[1])
-    ghost_threshold = state.ghost_threshold.at[idx0].set(new_thresholds[0]).at[idx1].set(new_thresholds[1])
-    ghost_write_idx = (state.ghost_write_idx + 2) % max_ghosts
-
-    return (ghost_waypoints, ghost_times, ghost_birth_time, ghost_origin_step,
-            ghost_type, ghost_active, ghost_excluded_cars, ghost_n_excluded,
-            ghost_threshold, ghost_write_idx)
+    Ghost B represents what would have happened had the cf car been dispatched.
+    pre_state supplies the car's waypoints and the origin step; next_state supplies
+    the ghost buffer fields (already updated by Ghost A write if applicable).
+    """
+    wp, t, _, _ = insert_and_optimize_trip(
+        distances, pre_state.waypoints[cf_car], pre_state.times[cf_car],
+        pre_state.event.src, pre_state.event.dest, pre_state.event.t, max_active_trips,
+    )
+    excluded = jnp.full(max_exclusions, -1, dtype=jnp.int32).at[0].set(cf_car)
+    idx = next_state.ghost_write_idx % max_ghosts
+    return next_state.replace(
+        ghost_waypoints=next_state.ghost_waypoints.at[idx].set(wp),
+        ghost_times=next_state.ghost_times.at[idx].set(t),
+        ghost_birth_time=next_state.ghost_birth_time.at[idx].set(pre_state.event.t),
+        ghost_origin_step=next_state.ghost_origin_step.at[idx].set(pre_state.time),
+        ghost_type=next_state.ghost_type.at[idx].set(jnp.array(1, dtype=jnp.int32)),
+        ghost_active=next_state.ghost_active.at[idx].set(True),
+        ghost_excluded_cars=next_state.ghost_excluded_cars.at[idx].set(excluded),
+        ghost_n_excluded=next_state.ghost_n_excluded.at[idx].set(jnp.array(1, dtype=jnp.int32)),
+        ghost_threshold=next_state.ghost_threshold.at[idx].set(threshold_b),
+        ghost_write_idx=(next_state.ghost_write_idx + 1) % max_ghosts,
+    )
 
 
 def expire_ghosts(state, current_time, ghost_max_lifespan):
@@ -479,16 +472,19 @@ def greedy_select_car(
     event: rs.RideshareEvent,
     max_active_trips: int,
     savings_threshold: float,
+    exclude_car: Integer[Array, ""] = jnp.array(-1, dtype=jnp.int32),
 ) -> Tuple[Integer[Array, ""], Bool[Array, ""]]:
     """Select the cheapest eligible car under the savings threshold.
 
     A car is eligible if it is solo (no active trips) or its marginal cost
     is below direct_cost * (1 - savings_threshold), where direct_cost is
-    the pickup-to-dropoff distance.
+    the pickup-to-dropoff distance. Car exclude_car is always ineligible
+    (use -1 to exclude nothing).
 
     Returns (car_idx, found); car_idx is valid only when found=True.
     """
     direct_cost = distances[event.src, event.dest]
+    car_indices = jnp.arange(waypoints.shape[0], dtype=jnp.int32)
 
     def cost_one(car_wp, car_t):
         is_solo = jnp.all(car_t <= event.t)
@@ -500,6 +496,7 @@ def greedy_select_car(
         return cost, eligible
 
     costs, eligible = jax.vmap(cost_one)(waypoints, times)
+    eligible = eligible & (car_indices != exclude_car)
 
     maxint = jnp.iinfo(costs.dtype).max
     masked_costs = jnp.where(eligible, costs, maxint)
@@ -562,8 +559,11 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
 
         The environment internally selects the canonical car (cheapest eligible
         under threshold_A) and the counterfactual car (cheapest eligible under
-        threshold_B). Dispatches to canonical if found,
-        otherwise unfulfills.
+        threshold_B). Dispatches the canonical car if found, otherwise unfulfills.
+
+        Ghost creation is symmetric and independent:
+          Ghost A is written iff A dispatches (canonical_found and feasible).
+          Ghost B is written iff B would dispatch (cf_found) and cf != canonical.
         """
         threshold_a = action[0].astype(jnp.float32)
         threshold_b = action[1].astype(jnp.float32)
@@ -572,19 +572,53 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             params.distances, state.waypoints, state.times, state.event,
             params.max_active_trips, threshold_a,
         )
+        canonical_car = jnp.where(canonical_found, canonical_car, jnp.array(-1, dtype=jnp.int32))
+        # cf search excludes canonical_car so the two arms always select different cars.
+        # When canonical_car=-1 (A unfulfills), exclude_car=-1 excludes nothing.
         cf_car, cf_found = greedy_select_car(
             params.distances, state.waypoints, state.times, state.event,
-            params.max_active_trips, threshold_b,
+            params.max_active_trips, threshold_b, exclude_car=canonical_car,
         )
-        # If no cf car found, fall back to canonical (triggers same-car skip)
-        cf_car = jnp.where(cf_found, cf_car, canonical_car)
+        cf_car = jnp.where(cf_found, cf_car, jnp.array(-1, dtype=jnp.int32))
 
-        return jax.lax.cond(
+        obs, next_state, reward, done, info = jax.lax.cond(
             canonical_found,
-            lambda: self.step_env_dispatch(
-                key, state, canonical_car, cf_car, threshold_a, threshold_b, params
-            ),
+            lambda: self.step_env_dispatch(key, state, canonical_car, params),
             lambda: self.step_env_unfulfill(key, state, params),
+        )
+
+        # Ghost A: canonical car pre-dispatch. Written iff A dispatched.
+        next_state = jax.lax.cond(
+            canonical_found,
+            lambda ns: apply_ghost_a(
+                state, ns, canonical_car, threshold_a,
+                params.max_exclusions, params.max_ghosts,
+            ),
+            lambda ns: ns,
+            next_state,
+        )
+
+        # Ghost B: cf car with trip inserted. Written iff B found.
+        next_state = jax.lax.cond(
+            cf_found,
+            lambda ns: apply_ghost_b(
+                state, ns, cf_car, threshold_b, params.distances,
+                params.max_active_trips, params.max_exclusions, params.max_ghosts,
+            ),
+            lambda ns: ns,
+            next_state,
+        )
+
+        return (
+            obs,
+            lax.stop_gradient(next_state),
+            reward,
+            done,
+            {
+                **info,
+                "action_A": canonical_car,  # already -1 when canonical_found=False
+                "action_B": cf_car,
+            },
         )
 
     def step_env_unfulfill(
@@ -634,7 +668,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
 
         return (
             lax.stop_gradient(self.get_obs(next_state)),
-            lax.stop_gradient(next_state),
+            next_state,
             jnp.array(reward, dtype=float),
             done,
             {
@@ -644,8 +678,6 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
                 "utilization": utilization,
                 "pct_cars_on_trip": pct_cars_on_trip,
                 "t": state.event.t,
-                "action_A": jnp.array(-1, dtype=jnp.int32),
-                "action_B": jnp.array(-1, dtype=jnp.int32),
                 **ghost_info,
             },
         )
@@ -655,9 +687,6 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         key: chex.PRNGKey,
         state: EnvState,
         canonical_car: Integer[Array, ""],
-        counterfactual_car: Integer[Array, ""],
-        threshold_a: Float[Array, ""],
-        threshold_b: Float[Array, ""],
         params: EnvParams,
     ) -> Tuple[chex.Array, EnvState, jnp.ndarray, jnp.ndarray, Dict[Any, Any]]:
         # Compute real car costs for ghost comparison
@@ -666,12 +695,12 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             state.event, params.max_active_trips,
         )
 
-        # Phase 1: Ghost trigger checks and updates
+        # Ghost trigger checks and updates on existing ghosts
         new_ghost_wps, new_ghost_ts, ghost_active, ghost_info = self._ghost_step(
             state, params, real_costs, real_is_feasible,
         )
 
-        # Phase 2: Execute canonical dispatch
+        # Execute canonical dispatch
         (
             new_car_wps,
             new_car_times,
@@ -689,41 +718,6 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         new_waypoints = state.waypoints.at[canonical_car].set(new_car_wps)
         new_times = state.times.at[canonical_car].set(new_car_times)
 
-        # Phase 3: Create new ghost pair (skip if canonical == counterfactual)
-        same_car = (canonical_car == counterfactual_car)
-        ghost_pair = create_ghost_pair(
-            params.distances, state, canonical_car, counterfactual_car,
-            state.event, params.max_active_trips, params.max_exclusions,
-            threshold_a, threshold_b,
-        )
-        gp_wps, gp_ts, gp_types, gp_excluded, gp_n_excluded, gp_thresholds = ghost_pair
-
-        # Write ghost state: first apply trigger updates, then write new pair.
-        # Skip writing when canonical == counterfactual (no counterfactual world to track).
-        state_with_updated_ghosts = state.replace(
-            ghost_waypoints=new_ghost_wps,
-            ghost_times=new_ghost_ts,
-            ghost_active=ghost_active,
-        )
-
-        def _write_ghosts(_):
-            return write_ghosts_to_buffer(
-                state_with_updated_ghosts,
-                gp_wps, gp_ts, gp_types, gp_excluded, gp_n_excluded, gp_thresholds,
-                state.event.t, params.max_ghosts,
-            )
-
-        def _skip_ghosts(_):
-            s = state_with_updated_ghosts
-            return (s.ghost_waypoints, s.ghost_times, s.ghost_birth_time,
-                    s.ghost_origin_step, s.ghost_type, s.ghost_active,
-                    s.ghost_excluded_cars, s.ghost_n_excluded, s.ghost_threshold,
-                    s.ghost_write_idx)
-
-        (g_waypoints, g_times, g_birth_time, g_origin_step,
-         g_type, g_active, g_excluded_cars, g_n_excluded,
-         g_threshold, g_write_idx) = jax.lax.cond(~same_car, _write_ghosts, _skip_ghosts, None)
-
         key, event_key = jax.random.split(state.key)
         next_event = rs.get_random_event(event_key, params.events, state.event.t)
         next_state = EnvState(
@@ -732,16 +726,16 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             times=new_times,
             key=key,
             event=next_event,
-            ghost_waypoints=g_waypoints,
-            ghost_times=g_times,
-            ghost_birth_time=g_birth_time,
-            ghost_origin_step=g_origin_step,
-            ghost_type=g_type,
-            ghost_active=g_active,
-            ghost_excluded_cars=g_excluded_cars,
-            ghost_n_excluded=g_n_excluded,
-            ghost_threshold=g_threshold,
-            ghost_write_idx=g_write_idx,
+            ghost_waypoints=new_ghost_wps,
+            ghost_times=new_ghost_ts,
+            ghost_birth_time=state.ghost_birth_time,
+            ghost_origin_step=state.ghost_origin_step,
+            ghost_type=state.ghost_type,
+            ghost_active=ghost_active,
+            ghost_excluded_cars=state.ghost_excluded_cars,
+            ghost_n_excluded=state.ghost_n_excluded,
+            ghost_threshold=state.ghost_threshold,
+            ghost_write_idx=state.ghost_write_idx,
         )
         done = self.is_terminal(next_state, params)
         trip_direct_cost = params.distances[state.event.src, state.event.dest]
@@ -755,7 +749,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
 
         results = (
             lax.stop_gradient(self.get_obs(next_state)),
-            lax.stop_gradient(next_state),
+            next_state,
             jnp.array(reward, dtype=float),
             done,
             {
@@ -765,8 +759,6 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
                 "utilization": utilization,
                 "pct_cars_on_trip": pct_cars_on_trip,
                 "t": state.event.t,
-                "action_A": canonical_car,
-                "action_B": counterfactual_car,
                 **ghost_info,
             },
         )

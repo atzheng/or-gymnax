@@ -30,13 +30,25 @@ Both cases represent a divergence between the real and counterfactual worlds —
 
 Each ghost tracks which real cars have been displaced in its counterfactual world via `ghost_excluded_cars` (a fixed-size array of car indices, padded with -1). For depth-0 (no branching), each ghost excludes exactly one car: the one it forked from. The max exclusion size is `ghost_max_branch_depth + 1`.
 
-### Same-car skip
+### Ghost creation
 
-If `action[0] == action[1]` (canonical and counterfactual are the same car), the two counterfactual worlds are identical and there is nothing to track. No ghost pair is created and `ghost_write_idx` is **not** advanced. All existing ghosts and their state (including `ghost_origin_step`) are left intact, so trigger detection and origin-step reporting for pre-existing ghosts are unaffected. The next genuine dispatch writes to the same buffer positions that would have been used had the skip not occurred.
+Ghost creation is symmetric and independent: Ghost A is written iff A fulfills; Ghost B is written iff B fulfills.
+
+| A | B | Ghosts written | `ghost_write_idx` advance |
+|---|---|---|---|
+| fulfills | fulfills | Ghost A + Ghost B | +2 |
+| fulfills | unfulfills | Ghost A only | +1 |
+| unfulfills | fulfills | Ghost B only | +1 |
+| unfulfills | unfulfills | none | 0 |
+
+Because the cf search always excludes the canonical car, the two arms always select different cars when both find one — there is no "same-car" case to skip.
+
+Ghost A = canonical car's state **before** dispatch ("what if A hadn't dispatched?").
+Ghost B = counterfactual car's state **with** the trip inserted ("what if B had dispatched?").
 
 ### Ring buffer
 
-Ghosts are stored in a fixed-size buffer of `max_ghosts` slots. A `ghost_write_idx` pointer advances by 2 each dispatch step where `canonical != counterfactual`, wrapping via modulo. Old ghosts are also deactivated when they exceed `ghost_max_lifespan`.
+Ghosts are stored in a fixed-size buffer of `max_ghosts` slots. `ghost_write_idx` advances as shown in the table above, wrapping via modulo. Old ghosts are also deactivated when they exceed `ghost_max_lifespan`.
 
 ### Expiry ordering
 
@@ -80,7 +92,7 @@ The environment internally selects cars using a deterministic greedy policy (`gr
 
 A car is **eligible** if it is solo (no active trips) or its marginal cost is below `direct_cost × (1 − threshold)`, where `direct_cost = distances[src, dest]` (the direct pickup-to-dropoff distance). This is the sole baseline for the savings threshold — independent of which solo cars happen to be available.
 
-If no canonical car is eligible, the step unfulfills. If no counterfactual car is found, it falls back to canonical (triggering the same-car skip).
+Ghost creation and logging are symmetric: `action_A` is the canonical car index or -1 if A unfulfills; `action_B` is the counterfactual car index or -1 if B unfulfills. Each is independent.
 
 `GreedyPolicy.apply` returns `[savings_threshold, savings_threshold]` — the policy's threshold for both arms. Car selection happens inside the environment.
 
@@ -105,8 +117,8 @@ All in `or_gymnax/rideshare_pool.py`:
 |----------|---------|
 | `check_ghost_triggers` | vmap over ghosts; returns `triggered`, `ghost_wins`, costs, feasibility |
 | `update_triggered_ghosts` | vmap dispatch trip to ghost-wins ghosts |
-| `create_ghost_pair` | Build Ghost A + Ghost B from canonical/cf car indices |
-| `write_ghosts_to_buffer` | Write 2 ghosts into ring buffer at write_idx |
+| `apply_ghost_a` | Write Ghost A (canonical pre-dispatch) into next_state's buffer |
+| `apply_ghost_b` | Write Ghost B (cf car with trip) into next_state's buffer |
 | `expire_ghosts` | Deactivate ghosts past lifespan |
 | `compute_real_car_costs` | vmap marginal cost over real fleet |
 | `_ghost_step` | Orchestrates trigger check, state update, and expiry |

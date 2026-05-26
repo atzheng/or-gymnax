@@ -239,130 +239,224 @@ def test_exclusion_prevents_self_comparison():
     assert excl == {canonical_car, cf_car}
 
 
-def test_no_ghost_when_same_car():
-    """When canonical == counterfactual, no ghosts are created and write_idx is unchanged."""
+"""
+Ghost creation 2x2 desired outcomes
+====================================
+
+The cf search always excludes canonical_car, so both arms always select
+different cars when eligible. There is no "same-car" case.
+
+  A fulfills, B fulfills  →  Ghost A (type 0) + Ghost B (type 1), write_idx +2
+  A fulfills, B unfulfills →  Ghost A only (type 0),               write_idx +1
+  A unfulfills, B fulfills →  Ghost B only (type 1),               write_idx +1
+  A unfulfills, B unfulfills → no ghosts,                          write_idx +0
+
+  action_A = canonical car index, or -1 if A unfulfills
+  action_B = cf car index,        or -1 if B unfulfills
+
+To engineer each case:
+  - Solo cars are always eligible regardless of threshold.
+  - Busy cars (times > event.t) are eligible only if
+    marginal_cost < direct_cost * (1 - threshold).
+  - threshold=0.0 → busy cars eligible if cheap to pool
+  - threshold=1.0 → only solo cars eligible
+  Use _HIGH_THRESH to force unfulfill when no solos are available.
+"""
+
+_HIGH_THRESH = 1.0   # only solos eligible; busy cars never pass
+
+
+def _make_busy_state(base_state):
+    """All 3 cars on active trips (no solos)."""
+    max_wp = _num_wp(ENV_PARAMS.max_active_trips)
+    event_t = int(base_state.event.t)
+    # One future waypoint per car so is_solo=False; rest zeros so capacity exists
+    times = jnp.zeros((_N_CARS, max_wp), dtype=jnp.int32).at[:, 0].set(event_t + 20)
+    return base_state.replace(times=times)
+
+
+def _make_one_solo_state(base_state):
+    """Car 0 solo; cars 1 and 2 busy."""
+    max_wp = _num_wp(ENV_PARAMS.max_active_trips)
+    event_t = int(base_state.event.t)
+    times = jnp.zeros((_N_CARS, max_wp), dtype=jnp.int32).at[1:, 0].set(event_t + 20)
+    return base_state.replace(times=times)
+
+
+# ---------------------------------------------------------------------------
+# 2x2 ghost creation cases
+# ---------------------------------------------------------------------------
+
+def test_both_fulfill_two_ghosts():
+    """
+    A fulfills, B fulfills → Ghost A + Ghost B, write_idx +2.
+
+    With threshold=[0.0, 0.0] and all-solo cars, A takes the cheapest car and
+    B (which excludes canonical) takes the second cheapest. Two different cars.
+    """
     key = jax.random.PRNGKey(0)
-    _, state = ENV.reset_env(key, ENV_PARAMS)
+    _, state = ENV.reset_env(key, ENV_PARAMS)  # all cars solo
 
-    # Call step_env_dispatch directly with same car to trigger the same-car skip
-    _, state2, _, _, _ = ENV.step_env_dispatch(
-        key, state,
-        jnp.array(0, dtype=jnp.int32), jnp.array(0, dtype=jnp.int32),
-        jnp.float32(0.0), jnp.float32(0.0),
-        ENV_PARAMS,
-    )
+    _, state2, _, _, info = ENV.step_env(key, state, jnp.array([0.0, 0.0]), ENV_PARAMS)
 
-    assert jnp.sum(state2.ghost_active) == 0, \
+    assert not bool(info["is_unfulfill"]), "A should have dispatched"
+    assert int(info["action_A"]) >= 0
+    assert int(info["action_B"]) >= 0
+    assert int(info["action_A"]) != int(info["action_B"]), "should be different cars"
+    assert int(jnp.sum(state2.ghost_active)) == 2, \
+        f"Expected 2 active ghosts, got {jnp.sum(state2.ghost_active)}"
+    active_types = state2.ghost_type[state2.ghost_active]
+    assert int(jnp.sum(active_types == 0)) == 1, "Expected 1 Ghost A"
+    assert int(jnp.sum(active_types == 1)) == 1, "Expected 1 Ghost B"
+    assert int(state2.ghost_write_idx) == int(state.ghost_write_idx) + 2
+
+
+def test_a_fulfills_b_unfulfills_ghost_a_only():
+    """
+    A fulfills, B unfulfills → Ghost A only (type 0), write_idx +1, action_B=-1.
+
+    State: car 0 solo, cars 1+2 busy.
+    threshold_a=0.0 → A picks car 0 (solo, cheapest/only eligible).
+    threshold_b=1.0 → B: only solos eligible; car 0 is excluded; cars 1,2 busy → B unfulfills.
+    """
+    key = jax.random.PRNGKey(0)
+    _, base = ENV.reset_env(key, ENV_PARAMS)
+    state = _make_one_solo_state(base)
+    action = jnp.array([0.0, _HIGH_THRESH])
+
+    _, state2, _, _, info = ENV.step_env(key, state, action, ENV_PARAMS)
+
+    assert not bool(info["is_unfulfill"]), "A should have dispatched"
+    assert int(info["action_A"]) >= 0, f"action_A={info['action_A']}"
+    assert int(info["action_B"]) == -1, f"Expected action_B=-1, got {info['action_B']}"
+    assert int(jnp.sum(state2.ghost_active)) == 1, \
+        f"Expected 1 active ghost, got {jnp.sum(state2.ghost_active)}"
+    ghost_idx = int(jnp.argmax(state2.ghost_active))
+    assert int(state2.ghost_type[ghost_idx]) == 0, "Expected Ghost A (type 0)"
+    assert int(state2.ghost_write_idx) == int(state.ghost_write_idx) + 1
+
+
+def test_a_unfulfills_b_fulfills_ghost_b_only():
+    """
+    A unfulfills, B fulfills → Ghost B only (type 1), write_idx +1, action_A=-1.
+
+    State: all cars busy.
+    threshold_a=1.0 → A: only solos eligible; none → A unfulfills (canonical_car=-1).
+    threshold_b=0.0 → B: pooling OK, exclude_car=-1 → picks cheapest poolable car.
+    """
+    key = jax.random.PRNGKey(0)
+    _, base = ENV.reset_env(key, ENV_PARAMS)
+    state = _make_busy_state(base)
+    action = jnp.array([_HIGH_THRESH, 0.0])
+
+    _, state2, _, _, info = ENV.step_env(key, state, action, ENV_PARAMS)
+
+    assert bool(info["is_unfulfill"]), "A should have unfulfilled"
+    assert int(info["action_A"]) == -1, f"Expected action_A=-1, got {info['action_A']}"
+    assert int(info["action_B"]) >= 0, f"action_B={info['action_B']}"
+    assert int(jnp.sum(state2.ghost_active)) == 1, \
+        f"Expected 1 active ghost, got {jnp.sum(state2.ghost_active)}"
+    ghost_idx = int(jnp.argmax(state2.ghost_active))
+    assert int(state2.ghost_type[ghost_idx]) == 1, "Expected Ghost B (type 1)"
+    assert int(state2.ghost_write_idx) == int(state.ghost_write_idx) + 1
+
+
+def test_both_unfulfill_no_ghosts():
+    """
+    A unfulfills, B unfulfills → no ghosts, write_idx unchanged, action_A=action_B=-1.
+
+    State: all cars busy.
+    threshold_a=threshold_b=1.0 → only solos eligible; none available → both unfulfill.
+    """
+    key = jax.random.PRNGKey(0)
+    _, base = ENV.reset_env(key, ENV_PARAMS)
+    state = _make_busy_state(base)
+    action = jnp.array([_HIGH_THRESH, _HIGH_THRESH])
+
+    _, state2, _, _, info = ENV.step_env(key, state, action, ENV_PARAMS)
+
+    assert bool(info["is_unfulfill"]), "Both should have unfulfilled"
+    assert int(info["action_A"]) == -1, f"Expected action_A=-1, got {info['action_A']}"
+    assert int(info["action_B"]) == -1, f"Expected action_B=-1, got {info['action_B']}"
+    assert int(jnp.sum(state2.ghost_active)) == 0, \
         f"Expected 0 active ghosts, got {jnp.sum(state2.ghost_active)}"
     assert int(state2.ghost_write_idx) == int(state.ghost_write_idx), \
-        f"Expected write_idx={state.ghost_write_idx}, got {state2.ghost_write_idx}"
+        "write_idx should be unchanged"
 
 
-def test_ghost_buffer_position_after_skip():
-    """Ghost buffer position accounting is correct when a same-car step skips creation."""
-    ep = ENV_PARAMS.replace(max_ghosts=8, ghost_max_lifespan=100)
+# ---------------------------------------------------------------------------
+# Ghost content verification for the single-ghost cases
+# ---------------------------------------------------------------------------
+
+def test_ghost_a_content_when_b_unfulfills():
+    """Ghost A content matches canonical car's pre-dispatch state."""
     key = jax.random.PRNGKey(0)
-    _, state = ENV.reset_env(key, ep)
+    _, base = ENV.reset_env(key, ENV_PARAMS)
+    state = _make_one_solo_state(base)
+    action = jnp.array([0.0, _HIGH_THRESH])
 
-    # Same-car dispatch: write_idx must stay at 0
-    key, sk = jax.random.split(key)
-    _, s1, _, _, _ = ENV.step_env_dispatch(
-        sk, state,
-        jnp.array(0, dtype=jnp.int32), jnp.array(0, dtype=jnp.int32),
-        jnp.float32(0.0), jnp.float32(0.0),
-        ep,
-    )
-    assert int(s1.ghost_write_idx) == 0
-    assert jnp.sum(s1.ghost_active) == 0
-
-    # Different cars: ghosts written at positions 0,1 (not 2,3)
-    key, sk = jax.random.split(key)
-    _, s2, _, _, info = ENV.step_env(sk, s1, _THRESH, ep)
+    _, state2, _, _, info = ENV.step_env(key, state, action, ENV_PARAMS)
     canonical_car = int(info["action_A"])
+    ghost_idx = int(jnp.argmax(state2.ghost_active))
+
+    assert jnp.array_equal(state2.ghost_waypoints[ghost_idx], state.waypoints[canonical_car])
+    assert jnp.array_equal(state2.ghost_times[ghost_idx], state.times[canonical_car])
+    assert int(state2.ghost_excluded_cars[ghost_idx][0]) == canonical_car
+
+
+def test_ghost_b_content_when_a_unfulfills():
+    """Ghost B content matches cf car with trip inserted."""
+    key = jax.random.PRNGKey(0)
+    _, base = ENV.reset_env(key, ENV_PARAMS)
+    state = _make_busy_state(base)
+    action = jnp.array([_HIGH_THRESH, 0.0])
+
+    _, state2, _, _, info = ENV.step_env(key, state, action, ENV_PARAMS)
     cf_car = int(info["action_B"])
-    assert canonical_car != cf_car, "Need different cars for this test"
-    assert int(s2.ghost_write_idx) == 2
-    assert jnp.sum(s2.ghost_active) == 2
-    assert s2.ghost_origin_step[0] == s1.time, \
-        f"Expected origin_step[0]={s1.time}, got {s2.ghost_origin_step[0]}"
-    assert s2.ghost_origin_step[1] == s1.time, \
-        f"Expected origin_step[1]={s1.time}, got {s2.ghost_origin_step[1]}"
-
-
-def test_oracle_ghost_triggers_after_same_car_skip():
-    """
-    Oracle test: ghost pairs created immediately after a same-car skip produce
-    correct trigger patterns and origin-step reporting over future steps.
-    """
-    key = jax.random.PRNGKey(7)
-    ep = ENV_PARAMS.replace(ghost_max_lifespan=20, max_ghosts=64)
-    _, state = ENV.reset_env(key, ep)
-
-    # Step 1: same-car dispatch — no ghost created, write_idx stays 0
-    key, sk = jax.random.split(key)
-    _, s1, _, _, _ = ENV.step_env_dispatch(
-        sk, state,
-        jnp.array(0, dtype=jnp.int32), jnp.array(0, dtype=jnp.int32),
-        jnp.float32(0.0), jnp.float32(0.0),
-        ep,
+    expected_wp, expected_t, _, _ = insert_and_optimize_trip(
+        ENV_PARAMS.distances,
+        state.waypoints[cf_car], state.times[cf_car],
+        state.event.src, state.event.dest, state.event.t,
+        ENV_PARAMS.max_active_trips,
     )
-    assert int(s1.ghost_write_idx) == 0
+    ghost_idx = int(jnp.argmax(state2.ghost_active))
 
-    # Step 2: fork — env picks canonical/cf; ghosts go to positions 0,1
-    key, sk = jax.random.split(key)
-    _, real_state, _, _, fork_info = ENV.step_env(sk, s1, _THRESH, ep)
-    canonical_car = int(fork_info["action_A"])
-    cf_car = int(fork_info["action_B"])
-    assert canonical_car != cf_car
-    assert int(real_state.ghost_write_idx) == 2
+    assert jnp.array_equal(state2.ghost_waypoints[ghost_idx], expected_wp)
+    assert jnp.array_equal(state2.ghost_times[ghost_idx], expected_t)
+    assert int(state2.ghost_excluded_cars[ghost_idx][0]) == cf_car
 
-    # Oracle: cf car gets the fork trip, track its evolving state
-    cf_wp, cf_t, _, _ = insert_and_optimize_trip(
-        ep.distances,
-        s1.waypoints[cf_car], s1.times[cf_car],
-        s1.event.src, s1.event.dest, s1.event.t,
-        ep.max_active_trips,
-    )
-    oracle_cf_wp, oracle_cf_t = cf_wp, cf_t
-    ghost_birth_time = int(s1.event.t)
 
-    # Locate the type-1 (cf-dispatched) ghost written at the fork step
-    ghost_type1_idx = jnp.argmax(
-        real_state.ghost_active & (real_state.ghost_type == 1)
-        & (real_state.ghost_origin_step == s1.time)
-    )
-    expected_origin_step = int(s1.time)
-    assert int(real_state.ghost_origin_step[ghost_type1_idx]) == expected_origin_step
+# ---------------------------------------------------------------------------
+# Buffer position tests (replacing same-car skip tests)
+# ---------------------------------------------------------------------------
 
-    real_s = real_state
-    oracle_active = True
+def test_ghost_buffer_advances_correctly():
+    """write_idx advances by 2, 1, 1, 0 for the four cases."""
+    ep = ENV_PARAMS.replace(max_ghosts=16, ghost_max_lifespan=100)
+    key = jax.random.PRNGKey(0)
+    _, base = ENV.reset_env(key, ep)
 
-    for i in range(6):
-        key, sk = jax.random.split(key)
-        event = real_s.event
+    busy = _make_busy_state(base)
+    solo = _make_one_solo_state(base)
+    all_solo = base  # fresh reset: all solo
 
-        oracle_triggered, oracle_ghost_wins, cf_new_wp, cf_new_t = _oracle_trigger_check(
-            oracle_cf_wp, oracle_cf_t, real_s, cf_car, 0.0, ep,
-        )
+    start_idx = int(base.ghost_write_idx)  # 0
 
-        if oracle_ghost_wins:
-            oracle_cf_wp, oracle_cf_t = cf_new_wp, cf_new_t
+    # Both fulfill: +2
+    _, s1, _, _, _ = ENV.step_env(key, all_solo, jnp.array([0.0, 0.0]), ep)
+    assert int(s1.ghost_write_idx) == start_idx + 2
 
-        _, real_s, _, _, info = ENV.step_env(sk, real_s, _THRESH, ep)
-        tracker_triggered = bool(info["ghost_triggered"][ghost_type1_idx])
+    # A fulfills, B unfulfills: +1
+    _, s2, _, _, _ = ENV.step_env(key, solo, jnp.array([0.0, _HIGH_THRESH]), ep)
+    assert int(s2.ghost_write_idx) == start_idx + 1
 
-        if int(event.t) - ghost_birth_time >= ep.ghost_max_lifespan:
-            oracle_active = False
-        oracle_triggered = oracle_triggered and oracle_active
+    # A unfulfills, B fulfills: +1
+    _, s3, _, _, _ = ENV.step_env(key, busy, jnp.array([_HIGH_THRESH, 0.0]), ep)
+    assert int(s3.ghost_write_idx) == start_idx + 1
 
-        assert oracle_triggered == tracker_triggered, (
-            f"Step +{i+1}: oracle={oracle_triggered}, tracker={tracker_triggered}"
-        )
-        if tracker_triggered:
-            reported = int(info["ghost_trigger_origin_steps"][ghost_type1_idx])
-            assert reported == expected_origin_step, (
-                f"Step +{i+1}: trigger origin_step={reported}, expected {expected_origin_step}"
-            )
+    # Both unfulfill: +0
+    _, s4, _, _, _ = ENV.step_env(key, busy, jnp.array([_HIGH_THRESH, _HIGH_THRESH]), ep)
+    assert int(s4.ghost_write_idx) == start_idx + 0
 
 
 def test_jit_and_scan_compatible():
@@ -405,10 +499,15 @@ if __name__ == "__main__":
         ("test_ghost_b_is_counterfactual_dispatch", test_ghost_b_is_counterfactual_dispatch),
         ("test_ring_buffer_wraps", test_ring_buffer_wraps),
         ("test_exclusion_prevents_self_comparison", test_exclusion_prevents_self_comparison),
-        ("test_no_ghost_when_same_car", test_no_ghost_when_same_car),
-        ("test_ghost_buffer_position_after_skip", test_ghost_buffer_position_after_skip),
+        # 2x2 ghost creation cases
+        ("test_both_fulfill_two_ghosts", test_both_fulfill_two_ghosts),
+        ("test_a_fulfills_b_unfulfills_ghost_a_only", test_a_fulfills_b_unfulfills_ghost_a_only),
+        ("test_a_unfulfills_b_fulfills_ghost_b_only", test_a_unfulfills_b_fulfills_ghost_b_only),
+        ("test_both_unfulfill_no_ghosts", test_both_unfulfill_no_ghosts),
+        ("test_ghost_a_content_when_b_unfulfills", test_ghost_a_content_when_b_unfulfills),
+        ("test_ghost_b_content_when_a_unfulfills", test_ghost_b_content_when_a_unfulfills),
+        ("test_ghost_buffer_advances_correctly", test_ghost_buffer_advances_correctly),
         ("test_oracle_forked_simulation", test_oracle_forked_simulation),
-        ("test_oracle_ghost_triggers_after_same_car_skip", test_oracle_ghost_triggers_after_same_car_skip),
         ("test_policy_returns_action_pair", test_policy_returns_action_pair),
         ("test_jit_and_scan_compatible", test_jit_and_scan_compatible),
     ]
