@@ -18,7 +18,7 @@ from or_gymnax.rideshare_pool import (
     RidesharePoolDispatch,
     GreedyPolicy,
     insert_and_optimize_trip,
-    compute_real_car_costs,
+    greedy_select_car,
     _num_wp,
 )
 
@@ -67,8 +67,8 @@ def test_basic_step_runs():
     obs, state = ENV.reset(key, ENV_PARAMS)
     obs2, state2, reward, done, info = ENV.step(key, state, _THRESH, ENV_PARAMS)
     assert obs2.shape == obs.shape
-    assert "ghost_triggered" in info
-    assert "n_ghost_triggers" in info
+    assert "group_triggered" in info
+    assert "n_group_triggers" in info
     assert "action_A" in info
     assert "action_B" in info
 
@@ -138,80 +138,41 @@ def test_ring_buffer_wraps():
     assert s3.group_origin_step[0] == s2.time
 
 
-def _oracle_trigger_check(oracle_cf_wp, oracle_cf_t, real_s, cf_car, threshold, ep):
-    """Compute oracle ghost-B trigger for one step under the given threshold."""
-    maxint = jnp.iinfo(jnp.int32).max
-    event = real_s.event
-    direct_cost = int(ep.distances[event.src, event.dest])
-
-    cf_new_wp, cf_new_t, cf_cost, cf_feas = insert_and_optimize_trip(
-        ep.distances, oracle_cf_wp, oracle_cf_t,
-        event.src, event.dest, event.t, ep.max_active_trips,
-    )
-    real_costs, real_feasible = compute_real_car_costs(
-        ep.distances, real_s.waypoints, real_s.times, event, ep.max_active_trips,
-    )
-    # Ghost eligibility: solo or passes threshold vs direct cost
-    cf_is_solo = bool(jnp.all(oracle_cf_t <= event.t))
-    cf_eligible = cf_is_solo or (int(cf_cost) < direct_cost * (1 - threshold))
-
-    real_is_solo = jnp.all(real_s.times <= event.t, axis=1)
-    real_eligible = real_feasible & (real_is_solo | (real_costs < direct_cost * (1 - threshold)))
-
-    # Ghost wins: ghost beats eligible real fleet (excluding cf_car)
-    masked_real = jnp.where(
-        real_eligible & (jnp.arange(_N_CARS) != cf_car), real_costs, maxint,
-    )
-    oracle_ghost_wins = bool(cf_feas) and cf_eligible and bool(cf_cost < jnp.min(masked_real))
-
-    # Canonical wins: cf_car is best eligible real car
-    eligible_real_costs = jnp.where(real_eligible, real_costs, maxint)
-    best_real_car = int(jnp.argmin(eligible_real_costs))
-    oracle_canonical_wins = (
-        bool(best_real_car == cf_car) and bool(jnp.min(eligible_real_costs) < maxint)
-    )
-
-    oracle_triggered = oracle_ghost_wins or oracle_canonical_wins
-    return oracle_triggered, oracle_ghost_wins, cf_new_wp, cf_new_t
-
-
 def test_oracle_forked_simulation():
     """
-    Oracle test: fork at step t, independently track the counterfactual car's
-    evolving state, and verify ghost trigger pattern matches.
+    Oracle test: fork at step t, independently track both ghost states,
+    build cf fleet each step, compare dispatch to canonical.
 
     Fork threshold [1.0, 0.0]: A picks car 0 (solo), B picks car 1 (cheap pool).
-    Ghost B = car 1 with trip, threshold=0.0 (cheap-pool eligible → likely triggers).
+    Ghost A = car 0 pre-dispatch, Ghost B = car 1 with trip.
     """
     key = jax.random.PRNGKey(7)
     ep = ENV_PARAMS.replace(ghost_max_lifespan=20, max_groups=32)
     _, base = ENV.reset_env(key, ep)
-    mpg = ep.max_ghosts_per_group
 
-    # Fork point: use mixed_state so both policies dispatch different cars
-    fork_thresh = jnp.array([1.0, 0.0])  # A=car0 (solo), B=car1 (cheap pool)
+    fork_thresh = jnp.array([1.0, 0.0])
     state = _make_mixed_state(base)
     key, sk = jax.random.split(key)
     _, real_state, _, _, fork_info = ENV.step_env(sk, state, fork_thresh, ep)
-    canonical_car = int(fork_info["action_A"])
-    cf_car = int(fork_info["action_B"])
+    ghost_a_car = int(fork_info["action_A"])
+    ghost_b_car = int(fork_info["action_B"])
 
-    # Oracle: cf car gets the trip at fork, track its evolving state
-    cf_wp, cf_t, _, _ = insert_and_optimize_trip(
+    # Oracle ghost states
+    oracle_a_wp = state.waypoints[ghost_a_car]
+    oracle_a_t = state.times[ghost_a_car]
+    b_wp, b_t, _, _ = insert_and_optimize_trip(
         ep.distances,
-        state.waypoints[cf_car], state.times[cf_car],
+        state.waypoints[ghost_b_car], state.times[ghost_b_car],
         state.event.src, state.event.dest, state.event.t,
         ep.max_active_trips,
     )
-    oracle_cf_wp = cf_wp
-    oracle_cf_t = cf_t
+    oracle_b_wp = b_wp
+    oracle_b_t = b_t
     ghost_birth_time = int(state.event.t)
 
-    # Find the ghost B slot (slot 1 of the group just created)
     g_idx = int(jnp.argmax(
         real_state.group_active & (real_state.group_origin_step == state.time)
     ))
-    ghost_b_slot_idx = g_idx * mpg + 1  # Ghost B is slot 1 in the group
 
     real_s = real_state
     oracle_active = True
@@ -220,20 +181,46 @@ def test_oracle_forked_simulation():
         key, sk = jax.random.split(key)
         event = real_s.event
 
-        oracle_triggered, oracle_ghost_wins, cf_new_wp, cf_new_t = _oracle_trigger_check(
-            oracle_cf_wp, oracle_cf_t, real_s, cf_car, 0.0, ep,
+        # Oracle: build cf fleet (swap both ghosts into real fleet)
+        cf_fleet_wp = real_s.waypoints.at[ghost_a_car].set(oracle_a_wp)
+        cf_fleet_wp = cf_fleet_wp.at[ghost_b_car].set(oracle_b_wp)
+        cf_fleet_t = real_s.times.at[ghost_a_car].set(oracle_a_t)
+        cf_fleet_t = cf_fleet_t.at[ghost_b_car].set(oracle_b_t)
+
+        # Canonical dispatch on real fleet
+        can_car, can_found = greedy_select_car(
+            ep.distances, real_s.waypoints, real_s.times, event,
+            ep.max_active_trips, 0.0,
+        )
+        # CF dispatch on cf fleet
+        cf_disp_car, cf_found = greedy_select_car(
+            ep.distances, cf_fleet_wp, cf_fleet_t, event,
+            ep.max_active_trips, 0.0,
         )
 
-        if oracle_ghost_wins:
-            oracle_cf_wp = cf_new_wp
-            oracle_cf_t = cf_new_t
+        oracle_triggered = bool(can_car != cf_disp_car) or bool(can_found != cf_found)
+
+        # Update oracle ghost if cf dispatched it
+        if bool(cf_found) and int(cf_disp_car) == ghost_a_car:
+            new_wp, new_t, _, _ = insert_and_optimize_trip(
+                ep.distances, oracle_a_wp, oracle_a_t,
+                event.src, event.dest, event.t, ep.max_active_trips,
+            )
+            oracle_a_wp = new_wp
+            oracle_a_t = new_t
+        elif bool(cf_found) and int(cf_disp_car) == ghost_b_car:
+            new_wp, new_t, _, _ = insert_and_optimize_trip(
+                ep.distances, oracle_b_wp, oracle_b_t,
+                event.src, event.dest, event.t, ep.max_active_trips,
+            )
+            oracle_b_wp = new_wp
+            oracle_b_t = new_t
 
         _, real_s, _, _, info = ENV.step_env(sk, real_s, _THRESH, ep)
 
-        # Map ghost_b_slot_idx to the flattened trigger array
-        tracker_triggered = bool(info["ghost_triggered"][ghost_b_slot_idx])
+        tracker_triggered = bool(info["group_triggered"][g_idx])
 
-        # Expire after trigger check (matches tracker: trigger uses prev-step active state)
+        # Expire after trigger check
         oracle_was_active = oracle_active
         if int(event.t) - ghost_birth_time >= ep.ghost_max_lifespan:
             oracle_active = False
@@ -599,7 +586,7 @@ def test_jit_and_scan_compatible():
         def step_fn(carry, rng):
             obs, state = carry
             obs, state, reward, done, info = ENV.step(rng, state, _THRESH, ENV_PARAMS)
-            return (obs, state), (reward, info["n_ghost_triggers"])
+            return (obs, state), (reward, info["n_group_triggers"])
         _, (rewards, triggers) = jax.lax.scan(
             step_fn, (obs, state), jax.random.split(key, 10),
         )

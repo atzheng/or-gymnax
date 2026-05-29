@@ -118,11 +118,11 @@ with open(OUTPUT, "w") as f:
             "utilization": _scalar(info.get("utilization", 0.0)),
             "pct_cars_on_trip": _scalar(info.get("pct_cars_on_trip", 0.0)),
             "discount": _scalar(info.get("discount", 0.0)),
-            "n_active_ghosts": int(info.get("n_active_ghosts", 0)),
-            "n_ghost_triggers": int(info.get("n_ghost_triggers", 0)),
+            "n_active_groups": int(info.get("n_active_groups", 0)),
+            "n_group_triggers": int(info.get("n_group_triggers", 0)),
             "oldest_ghost_age": _scalar(info.get("oldest_ghost_age", 0)),
-            "ghost_triggered": _scalar(info.get("ghost_triggered", [])),
-            "ghost_trigger_origin_steps": _scalar(info.get("ghost_trigger_origin_steps", [])),
+            "group_triggered": _scalar(info.get("group_triggered", [])),
+            "group_trigger_origin_steps": _scalar(info.get("group_trigger_origin_steps", [])),
             "action_A": _scalar(info.get("action_A", -1)),
             "action_B": _scalar(info.get("action_B", -1)),
             "info_t": _scalar(info.get("t", -1)),
@@ -139,7 +139,7 @@ with open(OUTPUT, "w") as f:
             print(f"  step={step:4d}  event_t={record['event_t']:5d}  "
                   f"action={record['action_canonical']}  "
                   f"reward={record['reward']:6.1f}  "
-                  f"active_ghosts={record['n_active_ghosts']:3d}  "
-                  f"triggers={record['n_ghost_triggers']}")
+                  f"active_groups={record['n_active_groups']:3d}  "
+                  f"triggers={record['n_group_triggers']}")
 
 print(f"Done. Log written to {OUTPUT}")

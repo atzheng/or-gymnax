@@ -108,10 +108,10 @@ Each step returns these keys in `info`:
 
 - `action_A`: scalar int32 — canonical car index chosen (-1 on unfulfill)
 - `action_B`: scalar int32 — counterfactual car index chosen (-1 on unfulfill)
-- `ghost_triggered`: `Bool[max_ghosts]` — which ghosts triggered (ghost wins OR canonical wins)
-- `ghost_trigger_origin_steps`: `Integer[max_ghosts]` — origin step of each triggered ghost (-1 if not triggered)
-- `n_ghost_triggers`: scalar — total number of triggers this step
-- `n_active_ghosts`: scalar — number of active ghosts after expiry
+- `group_triggered`: `Bool[max_groups]` — which groups triggered (canonical ≠ counterfactual dispatch)
+- `group_trigger_origin_steps`: `Integer[max_groups]` — origin step of each triggered group (-1 if not triggered)
+- `n_group_triggers`: scalar — total number of group triggers this step
+- `n_active_groups`: scalar — number of active groups after expiry
 
 ## Key functions
 
@@ -119,11 +119,11 @@ All in `or_gymnax/rideshare_pool.py`:
 
 | Function | Purpose |
 |----------|---------|
-| `check_ghost_triggers` | Flatten groups to per-slot, vmap trigger check; returns `triggered`, `ghost_wins`, costs, feasibility |
-| `update_triggered_ghosts` | vmap dispatch trip to ghost-wins slots |
-| `create_ghost_group` | Create a ghost group with 1 or 2 ghosts (replaces `apply_ghost_a`/`apply_ghost_b`) |
+| `check_group_triggers` | Per-group: build cf fleet (swap in ghosts), dispatch, compare to canonical; returns `triggered`, `cf_cars`, `cf_founds` |
+| `update_triggered_ghost_groups` | Update ghost state for triggered groups where cf dispatched a group ghost |
+| `create_ghost_group` | Create a ghost group with 1 or 2 ghosts |
 | `expire_groups` | Deactivate groups past lifespan |
-| `_flatten_groups_to_slots` | Expand group-level fields to per-slot arrays for vmap |
+| `greedy_select_car` | Select cheapest eligible car under savings threshold |
 | `compute_real_car_costs` | vmap marginal cost over real fleet |
 | `_ghost_step` | Orchestrates trigger check, state update, and expiry |
 
@@ -222,19 +222,25 @@ This eliminates stale reference bugs: when the group ring buffer wraps and group
 
 ### What changes from the current implementation
 
-| Aspect | Current (per-ghost) | Revised (per-group) |
-|--------|---------------------|---------------------|
-| Trigger unit | Individual ghost slot | Ghost group (by `origin_step`) |
-| Trigger rule | Ghost beats fleet, or excluded car is best | Single rule: canonical ≠ counterfactual dispatch |
-| Exclusion set | Per ghost: `{A}` or `{B}` | Per group: `{A, B, ...}`, grows on trigger |
-| Counterfactual dispatch | Each ghost independently vs real fleet minus its own exclusion | Build full counterfactual fleet (all group ghosts swapped in), dispatch once |
-| Group growth | Not implemented | Automatic on trigger: add ghosts for newly-divergent cars |
-| Trigger info | Per ghost slot | Per `origin_step` |
-| Size limit | `ghost_max_branch_depth` (confusing name) | `max_ghosts_per_group` (direct) |
+| Aspect | Implementation |
+|--------|---------------|
+| Trigger unit | Ghost group (by `origin_step`) |
+| Trigger rule | Single rule: canonical ≠ counterfactual dispatch |
+| Exclusion set | Per group: `{A, B, ...}` |
+| Counterfactual dispatch | Build full cf fleet (all group ghosts swapped in), dispatch once |
+| Group growth | Not yet implemented (future: add ghosts for newly-divergent cars) |
+| Trigger info | Per group (`group_triggered`, `group_trigger_origin_steps`, `n_group_triggers`) |
+| Size limit | `max_ghosts_per_group` |
+
+### Implemented
+
+- Per-group trigger checking: `check_group_triggers` builds cf fleet per group, dispatches, compares to canonical
+- Per-group state storage with contiguous slot blocks
+- Shared exclusion sets within groups
+- `max_ghosts_per_group` param
+- Current-action threshold for trigger checks (not stored group threshold)
 
 ### Not yet implemented
 
-- Per-group trigger checking logic (currently per-ghost)
-- Group growth on trigger
-- Shared exclusion sets within groups
-- `max_ghosts_per_group` param (replacing `ghost_max_branch_depth`)
+- Group growth on trigger (add ghosts for newly-divergent cars)
+- Oracle test for per-group trigger semantics with group growth
