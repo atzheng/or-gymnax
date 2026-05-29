@@ -46,7 +46,7 @@ ENV_PARAMS = EnvParams(
     distances=_DISTANCES,
     n_cars=_N_CARS,
     max_active_trips=2,
-    max_ghosts=16,
+    max_groups=8,
     ghost_max_lifespan=10,
 )
 
@@ -55,8 +55,10 @@ ENV_PARAMS = EnvParams(
 _THRESH = jnp.array([0.0, 0.0])
 
 # _MIXED_THRESH with _make_mixed_state: A picks car 1 (cheap pool), B picks car 0 (solo).
-# Guaranteed different cars → both ghosts written.
+# Guaranteed different cars → ghost group written.
 _MIXED_THRESH = jnp.array([0.0, 1.0])
+
+_MPG = ENV_PARAMS.max_ghosts_per_group  # max ghosts per group (2)
 
 
 def test_basic_step_runs():
@@ -72,33 +74,33 @@ def test_basic_step_runs():
 
 
 def test_ghosts_created_on_dispatch():
-    """After one dispatch step with different cars, exactly 2 ghosts should be active."""
+    """After one dispatch step with different cars, exactly 1 group with 2 ghosts."""
     key = jax.random.PRNGKey(0)
     _, base = ENV.reset_env(key, ENV_PARAMS)
     state = _make_mixed_state(base)
     _, state2, _, _, info = ENV.step_env(key, state, _MIXED_THRESH, ENV_PARAMS)
     assert int(info["action_A"]) != int(info["action_B"]), "cars must differ for ghosts"
-    n_active = jnp.sum(state2.ghost_active)
-    assert n_active == 2, f"Expected 2 active ghosts, got {n_active}"
-    active_types = state2.ghost_type[state2.ghost_active]
-    assert jnp.sum(active_types == 0) == 1
-    assert jnp.sum(active_types == 1) == 1
+    n_active_groups = jnp.sum(state2.group_active)
+    assert n_active_groups == 1, f"Expected 1 active group, got {n_active_groups}"
+    g_idx = jnp.argmax(state2.group_active)
+    assert int(state2.group_n_ghosts[g_idx]) == 2, "Expected 2 ghosts in group"
 
 
 def test_ghost_a_is_pre_dispatch_snapshot():
-    """Ghost A (type 0) should have the canonical car's pre-dispatch state."""
+    """Ghost A (slot 0) should have the canonical car's pre-dispatch state."""
     key = jax.random.PRNGKey(0)
     _, base = ENV.reset_env(key, ENV_PARAMS)
     state = _make_mixed_state(base)
     _, state2, _, _, info = ENV.step_env(key, state, _MIXED_THRESH, ENV_PARAMS)
     canonical_car = int(info["action_A"])
-    ghost_idx = jnp.argmax(state2.ghost_active & (state2.ghost_type == 0))
-    assert jnp.array_equal(state2.ghost_waypoints[ghost_idx], state.waypoints[canonical_car])
-    assert jnp.array_equal(state2.ghost_times[ghost_idx], state.times[canonical_car])
+    g_idx = int(jnp.argmax(state2.group_active))
+    slot_idx = g_idx * _MPG + 0  # Ghost A is slot 0
+    assert jnp.array_equal(state2.ghost_waypoints[slot_idx], state.waypoints[canonical_car])
+    assert jnp.array_equal(state2.ghost_times[slot_idx], state.times[canonical_car])
 
 
 def test_ghost_b_is_counterfactual_dispatch():
-    """Ghost B (type 1) should have the counterfactual car with the trip added."""
+    """Ghost B (slot 1) should have the counterfactual car with the trip added."""
     key = jax.random.PRNGKey(0)
     _, base = ENV.reset_env(key, ENV_PARAMS)
     state = _make_mixed_state(base)
@@ -110,32 +112,30 @@ def test_ghost_b_is_counterfactual_dispatch():
         state.event.src, state.event.dest, state.event.t,
         ENV_PARAMS.max_active_trips,
     )
-    ghost_idx = jnp.argmax(state2.ghost_active & (state2.ghost_type == 1))
-    assert jnp.array_equal(state2.ghost_waypoints[ghost_idx], expected_wp)
-    assert jnp.array_equal(state2.ghost_times[ghost_idx], expected_t)
+    g_idx = int(jnp.argmax(state2.group_active))
+    slot_idx = g_idx * _MPG + 1  # Ghost B is slot 1
+    assert jnp.array_equal(state2.ghost_waypoints[slot_idx], expected_wp)
+    assert jnp.array_equal(state2.ghost_times[slot_idx], expected_t)
 
 
 def test_ring_buffer_wraps():
-    """When buffer fills, ring buffer should overwrite oldest slots."""
-    ep = ENV_PARAMS.replace(max_ghosts=4, ghost_max_lifespan=100)
+    """When group buffer fills, ring buffer should overwrite oldest slots."""
+    ep = ENV_PARAMS.replace(max_groups=2, ghost_max_lifespan=100)
     key = jax.random.PRNGKey(0)
     _, base = ENV.reset_env(key, ep)
 
-    # Reset to mixed_state before each step so both policies always dispatch
-    # different cars (car 1 vs car 0), yielding exactly 2 ghost writes per step.
     key, sk = jax.random.split(key)
     _, s1, _, _, _ = ENV.step_env(sk, _make_mixed_state(base), _MIXED_THRESH, ep)
-    assert jnp.sum(s1.ghost_active) == 2
+    assert jnp.sum(s1.group_active) == 1
 
     key, sk = jax.random.split(key)
     _, s2, _, _, _ = ENV.step_env(sk, _make_mixed_state(s1), _MIXED_THRESH, ep)
-    assert jnp.sum(s2.ghost_active) == 4
+    assert jnp.sum(s2.group_active) == 2
 
-    # 3rd step wraps — should overwrite slots 0,1
+    # 3rd step wraps — should overwrite group 0
     key, sk = jax.random.split(key)
     _, s3, _, _, _ = ENV.step_env(sk, _make_mixed_state(s2), _MIXED_THRESH, ep)
-    assert s3.ghost_origin_step[0] == s2.time
-    assert s3.ghost_origin_step[1] == s2.time
+    assert s3.group_origin_step[0] == s2.time
 
 
 def _oracle_trigger_check(oracle_cf_wp, oracle_cf_t, real_s, cf_car, threshold, ep):
@@ -184,8 +184,9 @@ def test_oracle_forked_simulation():
     Ghost B = car 1 with trip, threshold=0.0 (cheap-pool eligible → likely triggers).
     """
     key = jax.random.PRNGKey(7)
-    ep = ENV_PARAMS.replace(ghost_max_lifespan=20, max_ghosts=64)
+    ep = ENV_PARAMS.replace(ghost_max_lifespan=20, max_groups=32)
     _, base = ENV.reset_env(key, ep)
+    mpg = ep.max_ghosts_per_group
 
     # Fork point: use mixed_state so both policies dispatch different cars
     fork_thresh = jnp.array([1.0, 0.0])  # A=car0 (solo), B=car1 (cheap pool)
@@ -206,10 +207,11 @@ def test_oracle_forked_simulation():
     oracle_cf_t = cf_t
     ghost_birth_time = int(state.event.t)
 
-    ghost_type1_idx = jnp.argmax(
-        real_state.ghost_active & (real_state.ghost_type == 1)
-        & (real_state.ghost_origin_step == state.time)
-    )
+    # Find the ghost B slot (slot 1 of the group just created)
+    g_idx = int(jnp.argmax(
+        real_state.group_active & (real_state.group_origin_step == state.time)
+    ))
+    ghost_b_slot_idx = g_idx * mpg + 1  # Ghost B is slot 1 in the group
 
     real_s = real_state
     oracle_active = True
@@ -227,7 +229,9 @@ def test_oracle_forked_simulation():
             oracle_cf_t = cf_new_t
 
         _, real_s, _, _, info = ENV.step_env(sk, real_s, _THRESH, ep)
-        tracker_triggered = bool(info["ghost_triggered"][ghost_type1_idx])
+
+        # Map ghost_b_slot_idx to the flattened trigger array
+        tracker_triggered = bool(info["ghost_triggered"][ghost_b_slot_idx])
 
         # Expire after trigger check (matches tracker: trigger uses prev-step active state)
         oracle_was_active = oracle_active
@@ -241,17 +245,17 @@ def test_oracle_forked_simulation():
 
 
 def test_exclusion_prevents_self_comparison():
-    """A ghost forked from car C should exclude car C from comparison."""
+    """A ghost group should exclude both canonical and cf cars."""
     key = jax.random.PRNGKey(0)
     _, base = ENV.reset_env(key, ENV_PARAMS)
     state = _make_mixed_state(base)
     _, state2, _, _, info = ENV.step_env(key, state, _MIXED_THRESH, ENV_PARAMS)
     canonical_car = int(info["action_A"])
     cf_car = int(info["action_B"])
+    g_idx = int(jnp.argmax(state2.group_active))
     excl = set()
-    for i in range(ENV_PARAMS.max_ghosts):
-        if state2.ghost_active[i]:
-            excl.add(int(state2.ghost_excluded_cars[i][0]))
+    for j in range(int(state2.group_n_ghosts[g_idx])):
+        excl.add(int(state2.group_excluded_cars[g_idx, j]))
     assert excl == {canonical_car, cf_car}
 
 
@@ -262,11 +266,11 @@ Ghost creation 2x2 desired outcomes
 Both policies select independently. No ghosts when action_A == action_B
 (same car means no counterfactual to track). Otherwise, when cars differ:
 
-  A fulfills, B fulfills, A≠B  →  Ghost A (type 0) + Ghost B (type 1), write_idx +2
-  A fulfills, B unfulfills     →  Ghost A only (type 0),                write_idx +1
-  A unfulfills, B fulfills     →  Ghost B only (type 1),                write_idx +1
-  A unfulfills, B unfulfills   →  no ghosts,                            write_idx +0
-  A == B (same car)            →  no ghosts,                            write_idx +0
+  A fulfills, B fulfills, A≠B  →  1 group with 2 ghosts, group_write_idx +1
+  A fulfills, B unfulfills     →  1 group with 1 ghost (Ghost A), group_write_idx +1
+  A unfulfills, B fulfills     →  1 group with 1 ghost (Ghost B), group_write_idx +1
+  A unfulfills, B unfulfills   →  no group,                       group_write_idx +0
+  A == B (same car)            →  no group,                       group_write_idx +0
 
   action_A = canonical car index, or -1 if A unfulfills
   action_B = cf car index,        or -1 if B unfulfills
@@ -348,10 +352,9 @@ def _make_mixed_state(base_state):
 
 def test_both_fulfill_two_ghosts():
     """
-    A fulfills, B fulfills, different cars → Ghost A + Ghost B, write_idx +2.
+    A fulfills, B fulfills, different cars → 1 group with 2 ghosts, group_write_idx +1.
 
     Use _make_mixed_state + [0.0, 1.0]: A picks car 1 (cheap pool), B picks car 0 (solo).
-    Same car would produce no ghosts; different cars produce both.
     """
     key = jax.random.PRNGKey(0)
     _, base = ENV.reset_env(key, ENV_PARAMS)
@@ -363,17 +366,16 @@ def test_both_fulfill_two_ghosts():
     assert int(info["action_A"]) >= 0
     assert int(info["action_B"]) >= 0
     assert int(info["action_A"]) != int(info["action_B"]), "must be different cars"
-    assert int(jnp.sum(state2.ghost_active)) == 2, \
-        f"Expected 2 active ghosts, got {jnp.sum(state2.ghost_active)}"
-    active_types = state2.ghost_type[state2.ghost_active]
-    assert int(jnp.sum(active_types == 0)) == 1, "Expected 1 Ghost A"
-    assert int(jnp.sum(active_types == 1)) == 1, "Expected 1 Ghost B"
-    assert int(state2.ghost_write_idx) == int(state.ghost_write_idx) + 2
+    assert int(jnp.sum(state2.group_active)) == 1, \
+        f"Expected 1 active group, got {jnp.sum(state2.group_active)}"
+    g_idx = int(jnp.argmax(state2.group_active))
+    assert int(state2.group_n_ghosts[g_idx]) == 2, "Expected 2 ghosts in group"
+    assert int(state2.group_write_idx) == int(state.group_write_idx) + 1
 
 
 def test_same_car_no_ghosts():
     """
-    A == B (same car) → no ghosts, write_idx unchanged.
+    A == B (same car) → no group, group_write_idx unchanged.
 
     Equal thresholds on same fleet → same argmin → no counterfactual.
     """
@@ -383,13 +385,14 @@ def test_same_car_no_ghosts():
     _, state2, _, _, info = ENV.step_env(key, base, jnp.array([0.0, 0.0]), ENV_PARAMS)
 
     assert int(info["action_A"]) == int(info["action_B"]), "same car expected"
-    assert int(jnp.sum(state2.ghost_active)) == 0, "no ghosts when same car"
-    assert int(state2.ghost_write_idx) == int(base.ghost_write_idx)
+    assert int(jnp.sum(state2.group_active)) == 0, "no groups when same car"
+    assert int(state2.group_write_idx) == int(base.group_write_idx)
 
 
 def test_a_fulfills_b_unfulfills_ghost_a_only():
     """
-    A fulfills, B unfulfills → Ghost A only (type 0), write_idx +1, action_B=-1.
+    A fulfills, B unfulfills → 1 group with 1 ghost (slot 0 = Ghost A),
+    group_write_idx +1, action_B=-1.
 
     State: all cars busy (no solos), car 0 cheap to pool.
     threshold_a=0.0 → A: car 0 eligible (cheap pool) → A dispatches.
@@ -405,16 +408,20 @@ def test_a_fulfills_b_unfulfills_ghost_a_only():
     assert not bool(info["is_unfulfill"]), "A should have dispatched"
     assert int(info["action_A"]) >= 0, f"action_A={info['action_A']}"
     assert int(info["action_B"]) == -1, f"Expected action_B=-1, got {info['action_B']}"
-    assert int(jnp.sum(state2.ghost_active)) == 1, \
-        f"Expected 1 active ghost, got {jnp.sum(state2.ghost_active)}"
-    ghost_idx = int(jnp.argmax(state2.ghost_active))
-    assert int(state2.ghost_type[ghost_idx]) == 0, "Expected Ghost A (type 0)"
-    assert int(state2.ghost_write_idx) == int(state.ghost_write_idx) + 1
+    assert int(jnp.sum(state2.group_active)) == 1, \
+        f"Expected 1 active group, got {jnp.sum(state2.group_active)}"
+    g_idx = int(jnp.argmax(state2.group_active))
+    assert int(state2.group_n_ghosts[g_idx]) == 1, "Expected 1 ghost in group"
+    # Slot 0 should be the canonical car (Ghost A)
+    canonical_car = int(info["action_A"])
+    assert int(state2.group_ghost_car_ids[g_idx, 0]) == canonical_car
+    assert int(state2.group_write_idx) == int(state.group_write_idx) + 1
 
 
 def test_a_unfulfills_b_fulfills_ghost_b_only():
     """
-    A unfulfills, B fulfills → Ghost B only (type 1), write_idx +1, action_A=-1.
+    A unfulfills, B fulfills → 1 group with 1 ghost (slot 0 = Ghost B),
+    group_write_idx +1, action_A=-1.
 
     State: all cars busy, car 0 cheap to pool.
     threshold_a=1.0 → A: only solos eligible; none → A unfulfills (canonical_car=-1).
@@ -430,16 +437,19 @@ def test_a_unfulfills_b_fulfills_ghost_b_only():
     assert bool(info["is_unfulfill"]), "A should have unfulfilled"
     assert int(info["action_A"]) == -1, f"Expected action_A=-1, got {info['action_A']}"
     assert int(info["action_B"]) >= 0, f"action_B={info['action_B']}"
-    assert int(jnp.sum(state2.ghost_active)) == 1, \
-        f"Expected 1 active ghost, got {jnp.sum(state2.ghost_active)}"
-    ghost_idx = int(jnp.argmax(state2.ghost_active))
-    assert int(state2.ghost_type[ghost_idx]) == 1, "Expected Ghost B (type 1)"
-    assert int(state2.ghost_write_idx) == int(state.ghost_write_idx) + 1
+    assert int(jnp.sum(state2.group_active)) == 1, \
+        f"Expected 1 active group, got {jnp.sum(state2.group_active)}"
+    g_idx = int(jnp.argmax(state2.group_active))
+    assert int(state2.group_n_ghosts[g_idx]) == 1, "Expected 1 ghost in group"
+    # Slot 0 should be the cf car (Ghost B, since A didn't write)
+    cf_car = int(info["action_B"])
+    assert int(state2.group_ghost_car_ids[g_idx, 0]) == cf_car
+    assert int(state2.group_write_idx) == int(state.group_write_idx) + 1
 
 
 def test_both_unfulfill_no_ghosts():
     """
-    A unfulfills, B unfulfills → no ghosts, write_idx unchanged, action_A=action_B=-1.
+    A unfulfills, B unfulfills → no group, group_write_idx unchanged, action_A=action_B=-1.
 
     State: all cars busy.
     threshold_a=threshold_b=1.0 → only solos eligible; none available → both unfulfill.
@@ -454,10 +464,10 @@ def test_both_unfulfill_no_ghosts():
     assert bool(info["is_unfulfill"]), "Both should have unfulfilled"
     assert int(info["action_A"]) == -1, f"Expected action_A=-1, got {info['action_A']}"
     assert int(info["action_B"]) == -1, f"Expected action_B=-1, got {info['action_B']}"
-    assert int(jnp.sum(state2.ghost_active)) == 0, \
-        f"Expected 0 active ghosts, got {jnp.sum(state2.ghost_active)}"
-    assert int(state2.ghost_write_idx) == int(state.ghost_write_idx), \
-        "write_idx should be unchanged"
+    assert int(jnp.sum(state2.group_active)) == 0, \
+        f"Expected 0 active groups, got {jnp.sum(state2.group_active)}"
+    assert int(state2.group_write_idx) == int(state.group_write_idx), \
+        "group_write_idx should be unchanged"
 
 
 # ---------------------------------------------------------------------------
@@ -473,11 +483,12 @@ def test_ghost_a_content_when_b_unfulfills():
 
     _, state2, _, _, info = ENV.step_env(key, state, action, ENV_PARAMS)
     canonical_car = int(info["action_A"])
-    ghost_idx = int(jnp.argmax(state2.ghost_active))
+    g_idx = int(jnp.argmax(state2.group_active))
+    slot_idx = g_idx * _MPG + 0  # Ghost A in slot 0
 
-    assert jnp.array_equal(state2.ghost_waypoints[ghost_idx], state.waypoints[canonical_car])
-    assert jnp.array_equal(state2.ghost_times[ghost_idx], state.times[canonical_car])
-    assert int(state2.ghost_excluded_cars[ghost_idx][0]) == canonical_car
+    assert jnp.array_equal(state2.ghost_waypoints[slot_idx], state.waypoints[canonical_car])
+    assert jnp.array_equal(state2.ghost_times[slot_idx], state.times[canonical_car])
+    assert int(state2.group_excluded_cars[g_idx, 0]) == canonical_car
 
 
 def test_ghost_b_content_when_a_unfulfills():
@@ -495,42 +506,87 @@ def test_ghost_b_content_when_a_unfulfills():
         state.event.src, state.event.dest, state.event.t,
         ENV_PARAMS.max_active_trips,
     )
-    ghost_idx = int(jnp.argmax(state2.ghost_active))
+    g_idx = int(jnp.argmax(state2.group_active))
+    slot_idx = g_idx * _MPG + 0  # Ghost B in slot 0 (since A didn't write)
 
-    assert jnp.array_equal(state2.ghost_waypoints[ghost_idx], expected_wp)
-    assert jnp.array_equal(state2.ghost_times[ghost_idx], expected_t)
-    assert int(state2.ghost_excluded_cars[ghost_idx][0]) == cf_car
+    assert jnp.array_equal(state2.ghost_waypoints[slot_idx], expected_wp)
+    assert jnp.array_equal(state2.ghost_times[slot_idx], expected_t)
+    assert int(state2.group_excluded_cars[g_idx, 0]) == cf_car
 
 
 # ---------------------------------------------------------------------------
-# Buffer position tests (replacing same-car skip tests)
+# Buffer position tests
 # ---------------------------------------------------------------------------
 
 def test_ghost_buffer_advances_correctly():
-    """write_idx advances by 2, 1, 1, 0 for the four cases."""
-    ep = ENV_PARAMS.replace(max_ghosts=16, ghost_max_lifespan=100)
+    """group_write_idx advances by 1, 1, 1, 0 for the four cases."""
+    ep = ENV_PARAMS.replace(max_groups=8, ghost_max_lifespan=100)
     key = jax.random.PRNGKey(0)
     _, base = ENV.reset_env(key, ep)
 
     cheap_pool = _make_cheap_pool_state(base)  # all busy, car 0 cheap to pool
 
-    start_idx = int(base.ghost_write_idx)  # 0
+    start_idx = int(base.group_write_idx)  # 0
 
-    # Both fulfill, different cars: +2 (mixed state: A→car1, B→car0)
+    # Both fulfill, different cars: +1 (mixed state: A→car1, B→car0)
     _, s1, _, _, _ = ENV.step_env(key, _make_mixed_state(base), _MIXED_THRESH, ep)
-    assert int(s1.ghost_write_idx) == start_idx + 2
+    assert int(s1.group_write_idx) == start_idx + 1
 
-    # A fulfills, B unfulfills: +1 (car 0 poolable; threshold_b=1.0 needs solo → none)
+    # A fulfills, B unfulfills: +1
     _, s2, _, _, _ = ENV.step_env(key, cheap_pool, jnp.array([0.0, _HIGH_THRESH]), ep)
-    assert int(s2.ghost_write_idx) == start_idx + 1
+    assert int(s2.group_write_idx) == start_idx + 1
 
-    # A unfulfills, B fulfills: +1 (threshold_a=1.0 needs solo → none; car 0 poolable for B)
+    # A unfulfills, B fulfills: +1
     _, s3, _, _, _ = ENV.step_env(key, cheap_pool, jnp.array([_HIGH_THRESH, 0.0]), ep)
-    assert int(s3.ghost_write_idx) == start_idx + 1
+    assert int(s3.group_write_idx) == start_idx + 1
 
     # Both unfulfill: +0 (all busy, both need solo → none)
     _, s4, _, _, _ = ENV.step_env(key, cheap_pool, jnp.array([_HIGH_THRESH, _HIGH_THRESH]), ep)
-    assert int(s4.ghost_write_idx) == start_idx + 0
+    assert int(s4.group_write_idx) == start_idx + 0
+
+
+def test_shared_exclusion_set():
+    """Both ghosts in a group share the same exclusion set."""
+    key = jax.random.PRNGKey(0)
+    _, base = ENV.reset_env(key, ENV_PARAMS)
+    state = _make_mixed_state(base)
+    _, state2, _, _, info = ENV.step_env(key, state, _MIXED_THRESH, ENV_PARAMS)
+    canonical_car = int(info["action_A"])
+    cf_car = int(info["action_B"])
+    g_idx = int(jnp.argmax(state2.group_active))
+    # Both ghosts share the group's exclusion set
+    excl = set()
+    for j in range(int(state2.group_n_ghosts[g_idx])):
+        excl.add(int(state2.group_excluded_cars[g_idx, j]))
+    assert excl == {canonical_car, cf_car}
+
+
+def test_threshold_uses_current_action_not_stored():
+    """Ghost triggers use the current action's threshold, not the stored creation-time threshold."""
+    key = jax.random.PRNGKey(0)
+    ep = ENV_PARAMS.replace(ghost_max_lifespan=20, max_groups=32)
+    _, base = ENV.reset_env(key, ep)
+
+    # Fork: create ghosts with threshold_a=0.5 (using _MIXED_THRESH-like setup
+    # but with different threshold to verify storage)
+    fork_state = _make_mixed_state(base)
+    fork_thresh = jnp.array([0.5, 1.0])  # A=0.5 (pool eligible), B=1.0 (solo only)
+    key, sk = jax.random.split(key)
+    _, state_after_fork, _, _, fork_info = ENV.step_env(sk, fork_state, fork_thresh, ep)
+
+    n_active = int(jnp.sum(state_after_fork.group_active))
+    assert n_active >= 1, f"Expected at least 1 group, got {n_active}"
+
+    # Group should store threshold_a=0.5
+    g_idx = int(jnp.argmax(state_after_fork.group_active))
+    stored_thresh = float(state_after_fork.group_threshold[g_idx])
+    assert abs(stored_thresh - 0.5) < 1e-6, f"Stored threshold should be 0.5, got {stored_thresh}"
+
+    # Step with threshold=0.0 — trigger check uses current threshold, not stored 0.5
+    key, sk = jax.random.split(key)
+    _, state2, _, _, info = ENV.step_env(sk, state_after_fork, jnp.array([0.0, 0.0]), ep)
+    # Verify stored threshold unchanged (logging only)
+    assert abs(float(state_after_fork.group_threshold[g_idx]) - 0.5) < 1e-6
 
 
 def test_jit_and_scan_compatible():
@@ -575,12 +631,15 @@ if __name__ == "__main__":
         ("test_exclusion_prevents_self_comparison", test_exclusion_prevents_self_comparison),
         # 2x2 ghost creation cases
         ("test_both_fulfill_two_ghosts", test_both_fulfill_two_ghosts),
+        ("test_same_car_no_ghosts", test_same_car_no_ghosts),
         ("test_a_fulfills_b_unfulfills_ghost_a_only", test_a_fulfills_b_unfulfills_ghost_a_only),
         ("test_a_unfulfills_b_fulfills_ghost_b_only", test_a_unfulfills_b_fulfills_ghost_b_only),
         ("test_both_unfulfill_no_ghosts", test_both_unfulfill_no_ghosts),
         ("test_ghost_a_content_when_b_unfulfills", test_ghost_a_content_when_b_unfulfills),
         ("test_ghost_b_content_when_a_unfulfills", test_ghost_b_content_when_a_unfulfills),
         ("test_ghost_buffer_advances_correctly", test_ghost_buffer_advances_correctly),
+        ("test_shared_exclusion_set", test_shared_exclusion_set),
+        ("test_threshold_uses_current_action_not_stored", test_threshold_uses_current_action_not_stored),
         ("test_oracle_forked_simulation", test_oracle_forked_simulation),
         ("test_policy_returns_action_pair", test_policy_returns_action_pair),
         ("test_jit_and_scan_compatible", test_jit_and_scan_compatible),

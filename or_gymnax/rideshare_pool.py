@@ -105,30 +105,33 @@ class EnvState(environment.EnvState):
     # The current ride request event
     event: rs.RideshareEvent
 
-    # Ghost car counterfactual tracking (fixed-size ring buffer)
-    ghost_waypoints: Integer[Array, "max_ghosts max_waypoints"]
-    ghost_times: Integer[Array, "max_ghosts max_waypoints"]
-    ghost_birth_time: Integer[Array, "max_ghosts"]
-    ghost_origin_step: Integer[Array, "max_ghosts"]
-    ghost_type: Integer[Array, "max_ghosts"]  # 0=canonical-not-dispatched, 1=cf-dispatched
-    ghost_active: Bool[Array, "max_ghosts"]
-    ghost_excluded_cars: Integer[Array, "max_ghosts max_exclusions"]  # -1 padded
-    ghost_n_excluded: Integer[Array, "max_ghosts"]
-    ghost_threshold: Float[Array, "max_ghosts"]  # savings threshold stored per ghost
-    ghost_write_idx: Integer[Array, ""]  # ring buffer pointer
+    # Ghost group state (ring buffer of groups)
+    group_origin_step: Integer[Array, "max_groups"]
+    group_birth_time: Integer[Array, "max_groups"]
+    group_active: Bool[Array, "max_groups"]
+    group_threshold: Float[Array, "max_groups"]  # creation-time threshold (logging only)
+    group_n_ghosts: Integer[Array, "max_groups"]  # 0, 1, or 2 ghosts per group
+    group_excluded_cars: Integer[Array, "max_groups max_ghosts_per_group"]  # -1 padded
+    group_ghost_car_ids: Integer[Array, "max_groups max_ghosts_per_group"]  # -1 padded
+    group_write_idx: Integer[Array, ""]  # ring buffer pointer for groups
+
+    # Ghost slot state (contiguous blocks: group g owns slots
+    # [g*max_ghosts_per_group, (g+1)*max_ghosts_per_group))
+    ghost_waypoints: Integer[Array, "max_ghost_slots max_waypoints"]
+    ghost_times: Integer[Array, "max_ghost_slots max_waypoints"]
 
 
 @struct.dataclass
 class EnvParams(rs.EnvParams):
     max_active_trips: int = struct.field(pytree_node=False, default=4)
     profit_margin: float = 1
-    max_ghosts: int = struct.field(pytree_node=False, default=128)
+    max_groups: int = struct.field(pytree_node=False, default=64)
+    max_ghosts_per_group: int = struct.field(pytree_node=False, default=2)
     ghost_max_lifespan: int = 50
-    ghost_max_branch_depth: int = struct.field(pytree_node=False, default=0)
 
     @property
-    def max_exclusions(self):
-        return self.ghost_max_branch_depth + 1
+    def max_ghost_slots(self):
+        return self.max_groups * self.max_ghosts_per_group
 
 
 def insert_and_optimize_trip(
@@ -305,28 +308,70 @@ def _ghost_marginal_cost(distances, ghost_wp, ghost_t, event, max_active_trips):
     return cost, is_feasible
 
 
+def _flatten_groups_to_slots(state, max_groups, max_ghosts_per_group):
+    """Expand group-level fields to per-slot arrays for vmap.
+
+    Returns per-slot views of: waypoints, times, excluded_cars, n_excluded, active.
+    Total number of slots = max_groups * max_ghosts_per_group.
+    """
+    n_slots = max_groups * max_ghosts_per_group
+    g_idx = jnp.repeat(jnp.arange(max_groups), max_ghosts_per_group)
+    local_idx = jnp.tile(jnp.arange(max_ghosts_per_group), max_groups)
+
+    # Per-slot validity: slot is valid if local_idx < group's n_ghosts
+    is_valid_slot = local_idx < state.group_n_ghosts[g_idx]
+
+    # Slot active = group active AND slot is valid
+    slot_active = state.group_active[g_idx] & is_valid_slot
+
+    # Per-ghost exclusion: each ghost excludes only its own car_id
+    # (preserves per-ghost trigger semantics; per-group dispatch is issue 89g)
+    slot_own_car = state.group_ghost_car_ids[g_idx, local_idx]  # (n_slots,)
+    slot_excluded_cars = jnp.full((n_slots, max_ghosts_per_group), -1, dtype=jnp.int32)
+    slot_excluded_cars = slot_excluded_cars.at[:, 0].set(slot_own_car)
+    slot_n_excluded = jnp.where(is_valid_slot, jnp.int32(1), jnp.int32(0))
+
+    # Ghost data is already stored in contiguous blocks
+    # slot index = g * max_ghosts_per_group + local_offset (which is just linear 0..n_slots-1)
+
+    return (
+        state.ghost_waypoints[:n_slots],  # (n_slots, max_wp)
+        state.ghost_times[:n_slots],  # (n_slots, max_wp)
+        slot_excluded_cars,  # (n_slots, max_ghosts_per_group)
+        slot_n_excluded,  # (n_slots,)
+        slot_active,  # (n_slots,)
+        g_idx,  # (n_slots,) — group index for each slot
+    )
+
+
 def check_ghost_triggers(
     distances, state, event, real_costs, real_is_feasible, max_active_trips,
+    threshold, max_groups, max_ghosts_per_group,
 ):
     """
-    For each active ghost, check if either:
-      (a) the ghost would beat the best eligible real car (excluding canonical), OR
-      (b) a canonical (excluded) car is the best eligible real car overall.
+    For each active ghost slot, check if either:
+      (a) the ghost would beat the best eligible real car (excluding group's cars), OR
+      (b) a group-excluded car is the best eligible real car overall.
 
-    Eligibility uses the ghost's stored savings_threshold and direct pickup-to-dropoff
-    cost as the solo baseline (not the cheapest available solo car).
+    Eligibility uses the current action's threshold (not the stored per-group
+    creation-time threshold) and direct pickup-to-dropoff cost as the solo
+    baseline. Both canonical and counterfactual fleets use the same threshold
+    to isolate the causal effect of car-state divergence.
 
-    Returns:
-        triggered: Bool[max_ghosts] — which ghosts triggered (ghost wins OR canonical wins)
-        ghost_wins: Bool[max_ghosts] — which ghosts would be dispatched (ghost beats real fleet)
-        ghost_costs: Integer[max_ghosts] — marginal cost per ghost
-        ghost_feasible: Bool[max_ghosts] — whether ghost insertion is feasible
+    Returns per-slot arrays (size max_groups * max_ghosts_per_group):
+        triggered: Bool — which slots triggered
+        ghost_wins: Bool — which slots would be dispatched
+        ghost_costs: Integer — marginal cost per slot
+        ghost_feasible: Bool — whether insertion is feasible
     """
     maxint = jnp.iinfo(real_costs.dtype).max
     direct_cost = distances[event.src, event.dest]
     real_is_solo = jnp.all(state.times <= event.t, axis=1)
 
-    def check_one_ghost(ghost_wp, ghost_t, excluded_cars, n_excluded, active, threshold):
+    slot_wps, slot_ts, slot_excluded, slot_n_excluded, slot_active, _ = \
+        _flatten_groups_to_slots(state, max_groups, max_ghosts_per_group)
+
+    def check_one_ghost(ghost_wp, ghost_t, excluded_cars, n_excluded, active):
         cost, feasible = _ghost_marginal_cost(
             distances, ghost_wp, ghost_t, event, max_active_trips,
         )
@@ -334,23 +379,20 @@ def check_ghost_triggers(
         ghost_is_solo = jnp.all(ghost_t <= event.t)
         ghost_eligible = ghost_is_solo | (cost < direct_cost * (1 - threshold))
 
-        # Build exclusion mask for this ghost
-        exclude_mask = jnp.zeros(real_costs.shape[0], dtype=bool)
-        exclude_mask = exclude_mask.at[excluded_cars].set(True)
-        idx_range = jnp.arange(excluded_cars.shape[0])
-        valid_exclusion = idx_range < n_excluded
-        exclude_mask = jnp.where(
-            jnp.any(valid_exclusion),
-            exclude_mask,
-            jnp.zeros_like(exclude_mask),
+        # Build exclusion mask using comparison (avoids -1 wrap-around indexing)
+        car_ids = jnp.arange(real_costs.shape[0])  # (n_cars,)
+        valid_excl = jnp.arange(excluded_cars.shape[0]) < n_excluded  # (max_exc,)
+        exclude_mask = jnp.any(
+            (car_ids[:, None] == excluded_cars[None, :]) & valid_excl[None, :],
+            axis=1,
         )
 
-        # Real car eligibility with this ghost's threshold
+        # Real car eligibility
         real_eligible = real_is_feasible & (
             real_is_solo | (real_costs < direct_cost * (1 - threshold))
         )
 
-        # Ghost wins: ghost beats eligible real fleet (excluding canonical cars)
+        # Ghost wins: ghost beats eligible real fleet (excluding group's cars)
         masked_real = jnp.where(exclude_mask | ~real_eligible, maxint, real_costs)
         best_real = jnp.min(masked_real)
         ghost_wins = active & feasible & ghost_eligible & (cost < best_real)
@@ -365,93 +407,107 @@ def check_ghost_triggers(
         return triggered, ghost_wins, cost, feasible
 
     triggered, ghost_wins, ghost_costs, ghost_feasible = jax.vmap(check_one_ghost)(
-        state.ghost_waypoints,
-        state.ghost_times,
-        state.ghost_excluded_cars,
-        state.ghost_n_excluded,
-        state.ghost_active,
-        state.ghost_threshold,
+        slot_wps, slot_ts, slot_excluded, slot_n_excluded, slot_active,
     )
     return triggered, ghost_wins, ghost_costs, ghost_feasible
 
 
 def update_triggered_ghosts(
     distances, state, event, triggered, max_active_trips,
+    max_groups, max_ghosts_per_group,
 ):
     """Update ghost car state for triggered ghosts (dispatch the current trip to them)."""
+    n_slots = max_groups * max_ghosts_per_group
+
     def update_one(ghost_wp, ghost_t, was_triggered):
         new_wp, new_t, _, _ = insert_and_optimize_trip(
             distances, ghost_wp, ghost_t,
             event.src, event.dest, event.t, max_active_trips,
         )
-        # Only update if triggered
         out_wp = jnp.where(was_triggered, new_wp, ghost_wp)
         out_t = jnp.where(was_triggered, new_t, ghost_t)
         return out_wp, out_t
 
     new_ghost_wps, new_ghost_ts = jax.vmap(update_one)(
-        state.ghost_waypoints, state.ghost_times, triggered,
+        state.ghost_waypoints[:n_slots],
+        state.ghost_times[:n_slots],
+        triggered,
     )
     return new_ghost_wps, new_ghost_ts
 
 
-def apply_ghost_a(pre_state, next_state, canonical_car, threshold_a, max_exclusions, max_ghosts):
-    """Write Ghost A (canonical car pre-dispatch) into next_state's ghost buffer.
+def create_ghost_group(
+    pre_state, next_state, canonical_car, cf_car,
+    write_a, write_b, threshold_a,
+    distances, max_active_trips, max_ghosts_per_group, max_groups,
+):
+    """Create a ghost group with Ghost A and/or Ghost B.
 
-    Ghost A represents the canonical car's state had it NOT been dispatched.
-    pre_state supplies the car's waypoints and the origin step; next_state supplies
-    the ghost buffer fields (already updated by trigger/expiry) and the write index.
+    Ghost A = canonical car's pre-dispatch state (what if it wasn't dispatched).
+    Ghost B = cf car with the trip inserted (what if it was dispatched instead).
+
+    Slot layout within the group: slot 0 = first ghost, slot 1 = second.
+    When only one ghost is written, it occupies slot 0.
     """
-    wp = pre_state.waypoints[canonical_car]
-    t = pre_state.times[canonical_car]
-    excluded = jnp.full(max_exclusions, -1, dtype=jnp.int32).at[0].set(canonical_car)
-    idx = next_state.ghost_write_idx % max_ghosts
-    return next_state.replace(
-        ghost_waypoints=next_state.ghost_waypoints.at[idx].set(wp),
-        ghost_times=next_state.ghost_times.at[idx].set(t),
-        ghost_birth_time=next_state.ghost_birth_time.at[idx].set(pre_state.event.t),
-        ghost_origin_step=next_state.ghost_origin_step.at[idx].set(pre_state.time),
-        ghost_type=next_state.ghost_type.at[idx].set(jnp.array(0, dtype=jnp.int32)),
-        ghost_active=next_state.ghost_active.at[idx].set(True),
-        ghost_excluded_cars=next_state.ghost_excluded_cars.at[idx].set(excluded),
-        ghost_n_excluded=next_state.ghost_n_excluded.at[idx].set(jnp.array(1, dtype=jnp.int32)),
-        ghost_threshold=next_state.ghost_threshold.at[idx].set(threshold_a),
-        ghost_write_idx=(next_state.ghost_write_idx + 1) % max_ghosts,
-    )
+    g_idx = next_state.group_write_idx % max_groups
+    base_slot = g_idx * max_ghosts_per_group
 
+    # Ghost A data: canonical car's pre-dispatch state
+    a_wp = pre_state.waypoints[canonical_car]
+    a_t = pre_state.times[canonical_car]
 
-def apply_ghost_b(pre_state, next_state, cf_car, threshold_b, distances,
-                  max_active_trips, max_exclusions, max_ghosts):
-    """Write Ghost B (cf car with trip inserted) into next_state's ghost buffer.
-
-    Ghost B represents what would have happened had the cf car been dispatched.
-    pre_state supplies the car's waypoints and the origin step; next_state supplies
-    the ghost buffer fields (already updated by Ghost A write if applicable).
-    """
-    wp, t, _, _ = insert_and_optimize_trip(
+    # Ghost B data: cf car with trip inserted
+    b_wp, b_t, _, _ = insert_and_optimize_trip(
         distances, pre_state.waypoints[cf_car], pre_state.times[cf_car],
-        pre_state.event.src, pre_state.event.dest, pre_state.event.t, max_active_trips,
+        pre_state.event.src, pre_state.event.dest, pre_state.event.t,
+        max_active_trips,
     )
-    excluded = jnp.full(max_exclusions, -1, dtype=jnp.int32).at[0].set(cf_car)
-    idx = next_state.ghost_write_idx % max_ghosts
+
+    n_ghosts = write_a.astype(jnp.int32) + write_b.astype(jnp.int32)
+
+    # Slot 0: A if write_a, else B
+    slot0_wp = jnp.where(write_a, a_wp, b_wp)
+    slot0_t = jnp.where(write_a, a_t, b_t)
+    slot0_car = jnp.where(write_a, canonical_car, cf_car)
+
+    # Slot 1: B (only meaningful when both write)
+    both = write_a & write_b
+    slot1_wp = jnp.where(both, b_wp, jnp.zeros_like(b_wp))
+    slot1_t = jnp.where(both, b_t, jnp.zeros_like(b_t))
+    slot1_car = jnp.where(both, cf_car, jnp.int32(-1))
+
+    # Write ghost slots
+    ghost_wps = (next_state.ghost_waypoints
+        .at[base_slot].set(slot0_wp)
+        .at[base_slot + 1].set(slot1_wp))
+    ghost_ts = (next_state.ghost_times
+        .at[base_slot].set(slot0_t)
+        .at[base_slot + 1].set(slot1_t))
+
+    # Exclusion set and car IDs
+    excluded = jnp.full(max_ghosts_per_group, -1, dtype=jnp.int32).at[0].set(slot0_car)
+    excluded = excluded.at[1].set(slot1_car)
+    car_ids = jnp.full(max_ghosts_per_group, -1, dtype=jnp.int32).at[0].set(slot0_car)
+    car_ids = car_ids.at[1].set(slot1_car)
+
     return next_state.replace(
-        ghost_waypoints=next_state.ghost_waypoints.at[idx].set(wp),
-        ghost_times=next_state.ghost_times.at[idx].set(t),
-        ghost_birth_time=next_state.ghost_birth_time.at[idx].set(pre_state.event.t),
-        ghost_origin_step=next_state.ghost_origin_step.at[idx].set(pre_state.time),
-        ghost_type=next_state.ghost_type.at[idx].set(jnp.array(1, dtype=jnp.int32)),
-        ghost_active=next_state.ghost_active.at[idx].set(True),
-        ghost_excluded_cars=next_state.ghost_excluded_cars.at[idx].set(excluded),
-        ghost_n_excluded=next_state.ghost_n_excluded.at[idx].set(jnp.array(1, dtype=jnp.int32)),
-        ghost_threshold=next_state.ghost_threshold.at[idx].set(threshold_b),
-        ghost_write_idx=(next_state.ghost_write_idx + 1) % max_ghosts,
+        ghost_waypoints=ghost_wps,
+        ghost_times=ghost_ts,
+        group_origin_step=next_state.group_origin_step.at[g_idx].set(pre_state.time),
+        group_birth_time=next_state.group_birth_time.at[g_idx].set(pre_state.event.t),
+        group_active=next_state.group_active.at[g_idx].set(True),
+        group_threshold=next_state.group_threshold.at[g_idx].set(threshold_a),
+        group_n_ghosts=next_state.group_n_ghosts.at[g_idx].set(n_ghosts),
+        group_excluded_cars=next_state.group_excluded_cars.at[g_idx].set(excluded),
+        group_ghost_car_ids=next_state.group_ghost_car_ids.at[g_idx].set(car_ids),
+        group_write_idx=(next_state.group_write_idx + 1) % max_groups,
     )
 
 
-def expire_ghosts(state, current_time, ghost_max_lifespan):
-    """Deactivate ghosts that have exceeded their lifespan."""
-    expired = (current_time - state.ghost_birth_time) >= ghost_max_lifespan
-    return state.ghost_active & ~expired
+def expire_groups(state, current_time, ghost_max_lifespan):
+    """Deactivate groups that have exceeded their lifespan."""
+    expired = (current_time - state.group_birth_time) >= ghost_max_lifespan
+    return state.group_active & ~expired
 
 
 def compute_real_car_costs(distances, waypoints, times, event, max_active_trips):
@@ -509,36 +565,47 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
     ):
         super().__init__(n_cars=n_cars, n_nodes=n_nodes, n_events=n_events)
 
-    def _ghost_step(self, state, params, real_costs, real_is_feasible):
+    def _ghost_step(self, state, params, real_costs, real_is_feasible, threshold):
         """Run ghost trigger checks and expiry. Returns updated ghost fields and trigger info."""
         event = state.event
+        max_groups = params.max_groups
+        mpg = params.max_ghosts_per_group
+        n_slots = max_groups * mpg
 
-        # Check which ghosts trigger
+        # Check which ghost slots trigger
         triggered, ghost_wins, ghost_costs, ghost_feasible = check_ghost_triggers(
             params.distances, state, event,
             real_costs, real_is_feasible, params.max_active_trips,
+            threshold, max_groups, mpg,
         )
 
         # Only dispatch trip to ghosts that actually won (not canonical-wins triggers)
         new_ghost_wps, new_ghost_ts = update_triggered_ghosts(
             params.distances, state, event, ghost_wins, params.max_active_trips,
+            max_groups, mpg,
         )
 
-        # Expire old ghosts
-        ghost_active = expire_ghosts(state, event.t, params.ghost_max_lifespan)
+        # Expire old groups
+        group_active = expire_groups(state, event.t, params.ghost_max_lifespan)
 
-        # Build trigger info
+        # Map slot-level triggers back to group-level for info
+        g_idx = jnp.repeat(jnp.arange(max_groups), mpg)
+        slot_origin_steps = state.group_origin_step[g_idx]
+
+        # Build trigger info (per-slot, matching old interface shape)
+        group_ages = jnp.where(group_active, event.t - state.group_birth_time, jnp.int32(0))
         ghost_info = {
             "ghost_triggered": triggered,
             "ghost_trigger_origin_steps": jnp.where(
-                triggered, state.ghost_origin_step, -1,
+                triggered, slot_origin_steps, -1,
             ),
             "n_ghost_triggers": jnp.sum(triggered),
-            "n_active_ghosts": jnp.sum(ghost_active),
+            "n_active_ghosts": jnp.sum(group_active),
+            "oldest_ghost_age": jnp.max(group_ages),
             "step": state.time,
         }
 
-        return new_ghost_wps, new_ghost_ts, ghost_active, ghost_info
+        return new_ghost_wps, new_ghost_ts, group_active, ghost_info
 
     def step_env(
         self,
@@ -556,11 +623,10 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         under threshold_A) and the counterfactual car (cheapest eligible under
         threshold_B). Dispatches the canonical car if found, otherwise unfulfills.
 
-        Ghost creation is symmetric and independent:
-          Ghost A is written iff A dispatches AND cf != canonical.
-          Ghost B is written iff B would dispatch AND cf != canonical.
-          When both policies choose the same car there is no counterfactual
-          to track, so no ghosts are written.
+        Ghost group creation:
+          A group is created iff the two policies pick different cars (or one
+          fulfills while the other doesn't). The group contains 1 or 2 ghosts
+          depending on which policies dispatch.
         """
         threshold_a = action[0].astype(jnp.float32)
         threshold_b = action[1].astype(jnp.float32)
@@ -578,29 +644,22 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
 
         obs, next_state, reward, done, info = jax.lax.cond(
             canonical_found,
-            lambda: self.step_env_dispatch(key, state, canonical_car, params),
-            lambda: self.step_env_unfulfill(key, state, params),
+            lambda: self.step_env_dispatch(key, state, canonical_car, params, threshold_a),
+            lambda: self.step_env_unfulfill(key, state, params, threshold_a),
         )
 
         different_cars = canonical_car != cf_car
+        write_a = canonical_found & different_cars
+        write_b = cf_found & different_cars
+        create_group = write_a | write_b
 
-        # Ghost A: canonical car pre-dispatch. Written iff A dispatched and cars differ.
         next_state = jax.lax.cond(
-            canonical_found & different_cars,
-            lambda ns: apply_ghost_a(
-                state, ns, canonical_car, threshold_a,
-                params.max_exclusions, params.max_ghosts,
-            ),
-            lambda ns: ns,
-            next_state,
-        )
-
-        # Ghost B: cf car with trip inserted. Written iff B found and cars differ.
-        next_state = jax.lax.cond(
-            cf_found & different_cars,
-            lambda ns: apply_ghost_b(
-                state, ns, cf_car, threshold_b, params.distances,
-                params.max_active_trips, params.max_exclusions, params.max_ghosts,
+            create_group,
+            lambda ns: create_ghost_group(
+                state, ns, canonical_car, cf_car,
+                write_a, write_b, threshold_a,
+                params.distances, params.max_active_trips,
+                params.max_ghosts_per_group, params.max_groups,
             ),
             lambda ns: ns,
             next_state,
@@ -623,6 +682,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         key: chex.PRNGKey,
         state: EnvState,
         params: EnvParams,
+        threshold: float = 0.0,
     ) -> Tuple[chex.Array, EnvState, jnp.ndarray, jnp.ndarray, Dict[Any, Any]]:
         # Compute real car costs for ghost comparison
         real_costs, real_is_feasible = compute_real_car_costs(
@@ -631,8 +691,8 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         )
 
         # Ghost step: check triggers, update, expire
-        new_ghost_wps, new_ghost_ts, ghost_active, ghost_info = self._ghost_step(
-            state, params, real_costs, real_is_feasible,
+        new_ghost_wps, new_ghost_ts, group_active, ghost_info = self._ghost_step(
+            state, params, real_costs, real_is_feasible, threshold,
         )
 
         key, event_key = jax.random.split(state.key)
@@ -643,16 +703,16 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             times=state.times,
             key=key,
             event=next_event,
+            group_origin_step=state.group_origin_step,
+            group_birth_time=state.group_birth_time,
+            group_active=group_active,
+            group_threshold=state.group_threshold,
+            group_n_ghosts=state.group_n_ghosts,
+            group_excluded_cars=state.group_excluded_cars,
+            group_ghost_car_ids=state.group_ghost_car_ids,
+            group_write_idx=state.group_write_idx,
             ghost_waypoints=new_ghost_wps,
             ghost_times=new_ghost_ts,
-            ghost_birth_time=state.ghost_birth_time,
-            ghost_origin_step=state.ghost_origin_step,
-            ghost_type=state.ghost_type,
-            ghost_active=ghost_active,
-            ghost_excluded_cars=state.ghost_excluded_cars,
-            ghost_n_excluded=state.ghost_n_excluded,
-            ghost_threshold=state.ghost_threshold,
-            ghost_write_idx=state.ghost_write_idx,
         )
         done = self.is_terminal(next_state, params)
         reward = 0.0
@@ -685,6 +745,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         state: EnvState,
         canonical_car: Integer[Array, ""],
         params: EnvParams,
+        threshold: float = 0.0,
     ) -> Tuple[chex.Array, EnvState, jnp.ndarray, jnp.ndarray, Dict[Any, Any]]:
         # Compute real car costs for ghost comparison
         real_costs, real_is_feasible = compute_real_car_costs(
@@ -693,8 +754,8 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         )
 
         # Ghost trigger checks and updates on existing ghosts
-        new_ghost_wps, new_ghost_ts, ghost_active, ghost_info = self._ghost_step(
-            state, params, real_costs, real_is_feasible,
+        new_ghost_wps, new_ghost_ts, group_active, ghost_info = self._ghost_step(
+            state, params, real_costs, real_is_feasible, threshold,
         )
 
         # Execute canonical dispatch
@@ -723,16 +784,16 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             times=new_times,
             key=key,
             event=next_event,
+            group_origin_step=state.group_origin_step,
+            group_birth_time=state.group_birth_time,
+            group_active=group_active,
+            group_threshold=state.group_threshold,
+            group_n_ghosts=state.group_n_ghosts,
+            group_excluded_cars=state.group_excluded_cars,
+            group_ghost_car_ids=state.group_ghost_car_ids,
+            group_write_idx=state.group_write_idx,
             ghost_waypoints=new_ghost_wps,
             ghost_times=new_ghost_ts,
-            ghost_birth_time=state.ghost_birth_time,
-            ghost_origin_step=state.ghost_origin_step,
-            ghost_type=state.ghost_type,
-            ghost_active=ghost_active,
-            ghost_excluded_cars=state.ghost_excluded_cars,
-            ghost_n_excluded=state.ghost_n_excluded,
-            ghost_threshold=state.ghost_threshold,
-            ghost_write_idx=state.ghost_write_idx,
         )
         done = self.is_terminal(next_state, params)
         trip_direct_cost = params.distances[state.event.src, state.event.dest]
@@ -763,7 +824,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         return jax.lax.cond(
             is_feasible,
             lambda: results,
-            lambda: self.step_env_unfulfill(key, state, params),
+            lambda: self.step_env_unfulfill(key, state, params, threshold),
         )
 
     def reset_env(
@@ -772,6 +833,9 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         """Performs resetting of environment."""
         key, key_reset = jax.random.split(key)
         max_wp = _num_wp(params.max_active_trips)
+        mg = params.max_groups
+        mpg = params.max_ghosts_per_group
+        n_slots = mg * mpg
         state = EnvState(
             time=0,
             waypoints=jax.random.choice(
@@ -782,18 +846,16 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             times=jnp.zeros((self.n_cars, max_wp), dtype=int),
             key=key,
             event=rs.get_random_event(key_reset, params.events, 0),
-            ghost_waypoints=jnp.zeros((params.max_ghosts, max_wp), dtype=int),
-            ghost_times=jnp.zeros((params.max_ghosts, max_wp), dtype=int),
-            ghost_birth_time=jnp.zeros(params.max_ghosts, dtype=int),
-            ghost_origin_step=jnp.full(params.max_ghosts, -1, dtype=int),
-            ghost_type=jnp.zeros(params.max_ghosts, dtype=int),
-            ghost_active=jnp.zeros(params.max_ghosts, dtype=bool),
-            ghost_excluded_cars=jnp.full(
-                (params.max_ghosts, params.max_exclusions), -1, dtype=int,
-            ),
-            ghost_n_excluded=jnp.zeros(params.max_ghosts, dtype=int),
-            ghost_threshold=jnp.zeros(params.max_ghosts, dtype=jnp.float32),
-            ghost_write_idx=jnp.array(0, dtype=int),
+            group_origin_step=jnp.full(mg, -1, dtype=int),
+            group_birth_time=jnp.zeros(mg, dtype=int),
+            group_active=jnp.zeros(mg, dtype=bool),
+            group_threshold=jnp.zeros(mg, dtype=jnp.float32),
+            group_n_ghosts=jnp.zeros(mg, dtype=int),
+            group_excluded_cars=jnp.full((mg, mpg), -1, dtype=int),
+            group_ghost_car_ids=jnp.full((mg, mpg), -1, dtype=int),
+            group_write_idx=jnp.array(0, dtype=int),
+            ghost_waypoints=jnp.zeros((n_slots, max_wp), dtype=int),
+            ghost_times=jnp.zeros((n_slots, max_wp), dtype=int),
         )
         return self.get_obs(state), state
 
