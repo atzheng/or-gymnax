@@ -19,6 +19,7 @@ from or_gymnax.rideshare_pool import (
     GreedyPolicy,
     insert_and_optimize_trip,
     greedy_select_car,
+    grow_group_on_trigger,
     _num_wp,
 )
 
@@ -608,6 +609,235 @@ def test_policy_returns_action_pair():
     _, _, reward, _, _ = ENV.step(key, state, action, ENV_PARAMS)
 
 
+# ---------------------------------------------------------------------------
+# grow_group_on_trigger unit tests
+# ---------------------------------------------------------------------------
+
+# Shared config for growth tests
+_G_N_CARS = 4
+_G_MPG = 4          # large enough to allow growth
+_G_MAX_GROUPS = 4
+_G_MAX_ACTIVE_TRIPS = 2
+_G_MAX_WP = _num_wp(_G_MAX_ACTIVE_TRIPS)
+_G_DISTANCES = jnp.array([
+    [0, 2, 5, 3],
+    [2, 0, 3, 4],
+    [5, 3, 0, 1],
+    [3, 4, 1, 0],
+])
+_G_EVENT = rs.RideshareEvent(
+    t=jnp.array(0, dtype=jnp.int32),
+    src=jnp.array(0, dtype=jnp.int32),
+    dest=jnp.array(1, dtype=jnp.int32),
+)
+
+
+def _grow_base_arrays(n_ghosts=2, excluded=None, car_ids=None, mpg=_G_MPG):
+    """Build input arrays for grow_group_on_trigger tests.
+
+    Group 0 is the active group under test. Other groups are inactive/zeroed.
+    Default: group 0 has 2 ghosts for cars 1 and 0, exclusion={1, 0}.
+    """
+    n_slots = _G_MAX_GROUPS * mpg
+
+    car_wps = jnp.zeros((_G_N_CARS, _G_MAX_WP), dtype=jnp.int32)
+    car_ts = jnp.zeros((_G_N_CARS, _G_MAX_WP), dtype=jnp.int32)
+    ghost_wps = jnp.zeros((n_slots, _G_MAX_WP), dtype=jnp.int32)
+    ghost_ts = jnp.zeros((n_slots, _G_MAX_WP), dtype=jnp.int32)
+
+    group_n_ghosts = jnp.zeros(_G_MAX_GROUPS, dtype=jnp.int32).at[0].set(n_ghosts)
+
+    if excluded is None:
+        excluded = [1, 0] + [-1] * (mpg - 2)
+    excl_arr = jnp.full((_G_MAX_GROUPS, mpg), -1, dtype=jnp.int32)
+    for j, v in enumerate(excluded[:mpg]):
+        excl_arr = excl_arr.at[0, j].set(v)
+
+    if car_ids is None:
+        car_ids = [1, 0] + [-1] * (mpg - 2)
+    cids_arr = jnp.full((_G_MAX_GROUPS, mpg), -1, dtype=jnp.int32)
+    for j, v in enumerate(car_ids[:mpg]):
+        cids_arr = cids_arr.at[0, j].set(v)
+
+    return car_wps, car_ts, ghost_wps, ghost_ts, group_n_ghosts, excl_arr, cids_arr
+
+
+def _call_grow(car_wps, car_ts, ghost_wps, ghost_ts,
+               group_n_ghosts, group_excluded, group_car_ids,
+               canonical_car, canonical_found, cf_car_g0, cf_found_g0,
+               mpg=_G_MPG):
+    """Helper: call grow_group_on_trigger with group 0 triggered."""
+    triggered = jnp.zeros(_G_MAX_GROUPS, dtype=jnp.bool_).at[0].set(True)
+    cf_cars = jnp.full(_G_MAX_GROUPS, -1, dtype=jnp.int32).at[0].set(cf_car_g0)
+    cf_founds = jnp.zeros(_G_MAX_GROUPS, dtype=jnp.bool_).at[0].set(cf_found_g0)
+    return grow_group_on_trigger(
+        car_wps, car_ts, ghost_wps, ghost_ts,
+        group_n_ghosts, group_excluded, group_car_ids,
+        triggered, cf_cars, cf_founds,
+        jnp.int32(canonical_car), jnp.bool_(canonical_found),
+        _G_DISTANCES, _G_EVENT, _G_MAX_ACTIVE_TRIPS, _G_MAX_GROUPS, mpg,
+    )
+
+
+def test_growth_cap_enforced():
+    """With n_ghosts == max_ghosts_per_group, no growth occurs even on trigger."""
+    mpg = 2
+    car_wps, car_ts, ghost_wps, ghost_ts, group_n_ghosts, group_excluded, group_car_ids = (
+        _grow_base_arrays(n_ghosts=2, excluded=[1, 0], car_ids=[1, 0], mpg=mpg)
+    )
+    new_n_ghosts, new_excl, new_ids, _, _ = _call_grow(
+        car_wps, car_ts, ghost_wps, ghost_ts,
+        group_n_ghosts, group_excluded, group_car_ids,
+        canonical_car=2, canonical_found=True,
+        cf_car_g0=3, cf_found_g0=True,
+        mpg=mpg,
+    )
+    assert int(new_n_ghosts[0]) == 2, f"Expected n_ghosts=2, got {int(new_n_ghosts[0])}"
+    # Exclusion set unchanged
+    assert set(int(x) for x in new_excl[0] if x >= 0) == {0, 1}
+
+
+def test_growth_adds_canonical_ghost():
+    """When canonical car X is new, Ghost X (pre-dispatch state) is added."""
+    car_wps, car_ts, ghost_wps, ghost_ts, group_n_ghosts, group_excl, group_ids = (
+        _grow_base_arrays()  # group 0: n_ghosts=2, exclusion={1,0}
+    )
+    # canonical=car 2 (new), cf=car 0 (already in group → no ghost Y)
+    new_n_ghosts, new_excl, new_ids, new_ghost_wps, new_ghost_ts = _call_grow(
+        car_wps, car_ts, ghost_wps, ghost_ts,
+        group_n_ghosts, group_excl, group_ids,
+        canonical_car=2, canonical_found=True,
+        cf_car_g0=0, cf_found_g0=True,
+    )
+    assert int(new_n_ghosts[0]) == 3, f"Expected n_ghosts=3, got {int(new_n_ghosts[0])}"
+    assert set(int(x) for x in new_excl[0] if x >= 0) == {0, 1, 2}
+    # Ghost X (slot 2 of group 0) should be car 2's pre-dispatch state
+    slot_x = 0 * _G_MPG + 2  # base_slot=0, local slot=2
+    assert jnp.array_equal(new_ghost_wps[slot_x], car_wps[2])
+    assert jnp.array_equal(new_ghost_ts[slot_x], car_ts[2])
+
+
+def test_growth_adds_cf_ghost():
+    """When cf car Y is new, Ghost Y (with-trip state) is added."""
+    car_wps, car_ts, ghost_wps, ghost_ts, group_n_ghosts, group_excl, group_ids = (
+        _grow_base_arrays()  # group 0: n_ghosts=2, exclusion={1,0}
+    )
+    # canonical=car 1 (already in group → no ghost X), cf=car 3 (new)
+    new_n_ghosts, new_excl, new_ids, new_ghost_wps, new_ghost_ts = _call_grow(
+        car_wps, car_ts, ghost_wps, ghost_ts,
+        group_n_ghosts, group_excl, group_ids,
+        canonical_car=1, canonical_found=True,
+        cf_car_g0=3, cf_found_g0=True,
+    )
+    assert int(new_n_ghosts[0]) == 3, f"Expected n_ghosts=3, got {int(new_n_ghosts[0])}"
+    assert set(int(x) for x in new_excl[0] if x >= 0) == {0, 1, 3}
+    # Ghost Y (slot 2 of group 0) should be car 3 with trip inserted
+    expected_wp, expected_t, _, _ = insert_and_optimize_trip(
+        _G_DISTANCES, car_wps[3], car_ts[3],
+        _G_EVENT.src, _G_EVENT.dest, _G_EVENT.t, _G_MAX_ACTIVE_TRIPS,
+    )
+    slot_y = 0 * _G_MPG + 2  # n_after_x=2 (canonical already excluded, no X added)
+    assert jnp.array_equal(new_ghost_wps[slot_y], expected_wp)
+    assert jnp.array_equal(new_ghost_ts[slot_y], expected_t)
+
+
+def test_growth_adds_both_x_and_y():
+    """When both canonical X and cf Y are new, both ghosts are added."""
+    car_wps, car_ts, ghost_wps, ghost_ts, group_n_ghosts, group_excl, group_ids = (
+        _grow_base_arrays()  # group 0: n_ghosts=2, exclusion={1,0}
+    )
+    # canonical=car 2 (new), cf=car 3 (new) — both new
+    new_n_ghosts, new_excl, new_ids, new_ghost_wps, new_ghost_ts = _call_grow(
+        car_wps, car_ts, ghost_wps, ghost_ts,
+        group_n_ghosts, group_excl, group_ids,
+        canonical_car=2, canonical_found=True,
+        cf_car_g0=3, cf_found_g0=True,
+    )
+    assert int(new_n_ghosts[0]) == 4, f"Expected n_ghosts=4, got {int(new_n_ghosts[0])}"
+    assert set(int(x) for x in new_excl[0] if x >= 0) == {0, 1, 2, 3}
+    # Ghost X at slot 2 (pre-dispatch state of car 2)
+    slot_x = 0 * _G_MPG + 2
+    assert jnp.array_equal(new_ghost_wps[slot_x], car_wps[2])
+    assert jnp.array_equal(new_ghost_ts[slot_x], car_ts[2])
+    # Ghost Y at slot 3 (car 3 with trip inserted)
+    expected_wp, expected_t, _, _ = insert_and_optimize_trip(
+        _G_DISTANCES, car_wps[3], car_ts[3],
+        _G_EVENT.src, _G_EVENT.dest, _G_EVENT.t, _G_MAX_ACTIVE_TRIPS,
+    )
+    slot_y = 0 * _G_MPG + 3
+    assert jnp.array_equal(new_ghost_wps[slot_y], expected_wp)
+    assert jnp.array_equal(new_ghost_ts[slot_y], expected_t)
+
+
+def test_growth_x_already_excluded_no_duplicate():
+    """When canonical car X is already in exclusion set, no ghost added for X."""
+    car_wps, car_ts, ghost_wps, ghost_ts, group_n_ghosts, group_excl, group_ids = (
+        _grow_base_arrays()  # group 0: exclusion={1,0}
+    )
+    # canonical=car 0 (already excluded), cf=car 3 (new)
+    new_n_ghosts, new_excl, new_ids, _, _ = _call_grow(
+        car_wps, car_ts, ghost_wps, ghost_ts,
+        group_n_ghosts, group_excl, group_ids,
+        canonical_car=0, canonical_found=True,
+        cf_car_g0=3, cf_found_g0=True,
+    )
+    assert int(new_n_ghosts[0]) == 3, f"Expected n_ghosts=3, got {int(new_n_ghosts[0])}"
+    # Only car 3 added, not car 0 again
+    assert set(int(x) for x in new_excl[0] if x >= 0) == {0, 1, 3}
+
+
+def test_growth_y_already_excluded_no_duplicate():
+    """When cf car Y is already in exclusion set, no ghost added for Y."""
+    car_wps, car_ts, ghost_wps, ghost_ts, group_n_ghosts, group_excl, group_ids = (
+        _grow_base_arrays()  # group 0: exclusion={1,0}
+    )
+    # canonical=car 2 (new), cf=car 1 (already excluded)
+    new_n_ghosts, new_excl, new_ids, _, _ = _call_grow(
+        car_wps, car_ts, ghost_wps, ghost_ts,
+        group_n_ghosts, group_excl, group_ids,
+        canonical_car=2, canonical_found=True,
+        cf_car_g0=1, cf_found_g0=True,
+    )
+    assert int(new_n_ghosts[0]) == 3, f"Expected n_ghosts=3, got {int(new_n_ghosts[0])}"
+    # Only car 2 added, not car 1 again
+    assert set(int(x) for x in new_excl[0] if x >= 0) == {0, 1, 2}
+
+
+def test_growth_no_trigger_no_change():
+    """Groups that did not trigger are unchanged."""
+    car_wps, car_ts, ghost_wps, ghost_ts, group_n_ghosts, group_excl, group_ids = (
+        _grow_base_arrays()
+    )
+    # Don't trigger group 0 at all
+    triggered = jnp.zeros(_G_MAX_GROUPS, dtype=jnp.bool_)
+    cf_cars = jnp.full(_G_MAX_GROUPS, -1, dtype=jnp.int32)
+    cf_founds = jnp.zeros(_G_MAX_GROUPS, dtype=jnp.bool_)
+    new_n_ghosts, new_excl, new_ids, _, _ = grow_group_on_trigger(
+        car_wps, car_ts, ghost_wps, ghost_ts,
+        group_n_ghosts, group_excl, group_ids,
+        triggered, cf_cars, cf_founds,
+        jnp.int32(2), jnp.bool_(True),
+        _G_DISTANCES, _G_EVENT, _G_MAX_ACTIVE_TRIPS, _G_MAX_GROUPS, _G_MPG,
+    )
+    assert int(new_n_ghosts[0]) == 2, "Untriggered group should not grow"
+    assert set(int(x) for x in new_excl[0] if x >= 0) == {0, 1}
+
+
+def test_growth_depth2_unchanged():
+    """With max_ghosts_per_group=2 (default), existing tests still pass (no growth)."""
+    # Run the existing ghost creation test to verify depth=2 behavior unchanged
+    key = jax.random.PRNGKey(0)
+    _, base = ENV.reset_env(key, ENV_PARAMS)
+    state = _make_mixed_state(base)
+    _, state2, _, _, info = ENV.step_env(key, state, _MIXED_THRESH, ENV_PARAMS)
+    g_idx = int(jnp.argmax(state2.group_active))
+    # With mpg=2, group stays at exactly 2 ghosts after creation and any triggers
+    assert int(state2.group_n_ghosts[g_idx]) == 2
+    assert set(int(x) for x in state2.group_excluded_cars[g_idx] if x >= 0) == {
+        int(info["action_A"]), int(info["action_B"])
+    }
+
+
 if __name__ == "__main__":
     tests = [
         ("test_basic_step_runs", test_basic_step_runs),
@@ -630,6 +860,15 @@ if __name__ == "__main__":
         ("test_oracle_forked_simulation", test_oracle_forked_simulation),
         ("test_policy_returns_action_pair", test_policy_returns_action_pair),
         ("test_jit_and_scan_compatible", test_jit_and_scan_compatible),
+        # Group growth tests
+        ("test_growth_cap_enforced", test_growth_cap_enforced),
+        ("test_growth_adds_canonical_ghost", test_growth_adds_canonical_ghost),
+        ("test_growth_adds_cf_ghost", test_growth_adds_cf_ghost),
+        ("test_growth_adds_both_x_and_y", test_growth_adds_both_x_and_y),
+        ("test_growth_x_already_excluded_no_duplicate", test_growth_x_already_excluded_no_duplicate),
+        ("test_growth_y_already_excluded_no_duplicate", test_growth_y_already_excluded_no_duplicate),
+        ("test_growth_no_trigger_no_change", test_growth_no_trigger_no_change),
+        ("test_growth_depth2_unchanged", test_growth_depth2_unchanged),
     ]
     for name, fn in tests:
         try:

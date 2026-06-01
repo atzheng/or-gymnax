@@ -401,6 +401,137 @@ def update_triggered_ghost_groups(
     return updated_wps.reshape(n_slots, max_wp), updated_ts.reshape(n_slots, max_wp)
 
 
+def grow_group_on_trigger(
+    car_waypoints,        # (n_cars, max_wp) - real fleet pre-dispatch states
+    car_times,            # (n_cars, max_wp)
+    ghost_waypoints,      # (n_slots, max_wp) - ghost states after update_triggered step
+    ghost_times,          # (n_slots, max_wp)
+    group_n_ghosts,       # (max_groups,)
+    group_excluded_cars,  # (max_groups, mpg)
+    group_ghost_car_ids,  # (max_groups, mpg)
+    triggered,            # (max_groups,) bool
+    cf_cars,              # (max_groups,) int - cf dispatch car per group (-1 if not found)
+    cf_founds,            # (max_groups,) bool
+    canonical_car,        # scalar int32
+    canonical_found,      # scalar bool
+    distances, event, max_active_trips, max_groups, max_ghosts_per_group,
+):
+    """Grow ghost groups on trigger by adding ghosts for newly divergent cars.
+
+    For each triggered group (canonical ≠ cf dispatch):
+    - Car X (canonical): add Ghost X (pre-dispatch state) if X not already in exclusion set.
+    - Car Y (cf): add Ghost Y (with-trip state) if Y not already in exclusion set.
+      If Y is already a ghost, it was updated by update_triggered_ghost_groups; no duplicate.
+
+    Growth is capped at max_ghosts_per_group per group.
+    """
+    mpg = max_ghosts_per_group
+    max_wp = ghost_waypoints.shape[-1]
+    n_slots = max_groups * mpg
+
+    all_ghost_wps = ghost_waypoints[:n_slots].reshape(max_groups, mpg, max_wp)
+    all_ghost_ts = ghost_times[:n_slots].reshape(max_groups, mpg, max_wp)
+
+    # Canonical car's pre-dispatch state (shared across all groups)
+    canonical_car_wp = car_waypoints[canonical_car]
+    canonical_car_t = car_times[canonical_car]
+
+    # Cf car states per group (safe indexing: clamp invalid -1 to 0)
+    safe_cf_cars = jnp.where(cf_cars >= 0, cf_cars, jnp.int32(0))
+    cf_car_wps = car_waypoints[safe_cf_cars]  # (max_groups, max_wp)
+    cf_car_ts = car_times[safe_cf_cars]        # (max_groups, max_wp)
+
+    def grow_one_group(
+        group_triggered, cf_car, cf_found,
+        group_n_ghosts, group_excluded_cars, group_ghost_car_ids,
+        group_ghost_wps, group_ghost_ts,
+        cf_car_wp, cf_car_t,
+    ):
+        # Check if canonical car (X) is already in this group's exclusion set
+        x_in_set = jnp.any(group_excluded_cars == canonical_car)
+        add_x = group_triggered & canonical_found & ~x_in_set & (group_n_ghosts < mpg)
+
+        # Check if cf car (Y) is already in this group's exclusion set
+        y_in_set = jnp.any(group_excluded_cars == cf_car)
+        n_after_x = group_n_ghosts + add_x.astype(jnp.int32)
+        add_y = group_triggered & cf_found & ~y_in_set & (n_after_x < mpg)
+
+        # Local slot indices within the group's contiguous block
+        slot_x = group_n_ghosts
+        slot_y = n_after_x
+
+        # Ghost Y state: cf car with the trip inserted
+        y_wp_new, y_t_new, _, _ = insert_and_optimize_trip(
+            distances, cf_car_wp, cf_car_t,
+            event.src, event.dest, event.t, max_active_trips,
+        )
+
+        # Write ghost X (canonical car's pre-dispatch state)
+        new_group_wps = jnp.where(
+            add_x,
+            group_ghost_wps.at[slot_x].set(canonical_car_wp),
+            group_ghost_wps,
+        )
+        new_group_ts = jnp.where(
+            add_x,
+            group_ghost_ts.at[slot_x].set(canonical_car_t),
+            group_ghost_ts,
+        )
+
+        # Write ghost Y (cf car with trip)
+        new_group_wps = jnp.where(
+            add_y,
+            new_group_wps.at[slot_y].set(y_wp_new),
+            new_group_wps,
+        )
+        new_group_ts = jnp.where(
+            add_y,
+            new_group_ts.at[slot_y].set(y_t_new),
+            new_group_ts,
+        )
+
+        # Update n_ghosts
+        new_n_ghosts = group_n_ghosts + add_x.astype(jnp.int32) + add_y.astype(jnp.int32)
+
+        # Update exclusion set and car ID arrays
+        new_excluded = jnp.where(
+            add_x,
+            group_excluded_cars.at[slot_x].set(canonical_car),
+            group_excluded_cars,
+        )
+        new_excluded = jnp.where(
+            add_y,
+            new_excluded.at[slot_y].set(cf_car),
+            new_excluded,
+        )
+        new_car_ids = jnp.where(
+            add_x,
+            group_ghost_car_ids.at[slot_x].set(canonical_car),
+            group_ghost_car_ids,
+        )
+        new_car_ids = jnp.where(
+            add_y,
+            new_car_ids.at[slot_y].set(cf_car),
+            new_car_ids,
+        )
+
+        return new_n_ghosts, new_excluded, new_car_ids, new_group_wps, new_group_ts
+
+    new_n_ghosts, new_excluded, new_car_ids, new_group_wps, new_group_ts = jax.vmap(
+        grow_one_group
+    )(
+        triggered, cf_cars, cf_founds,
+        group_n_ghosts, group_excluded_cars, group_ghost_car_ids,
+        all_ghost_wps, all_ghost_ts,
+        cf_car_wps, cf_car_ts,
+    )
+
+    new_ghost_wps = new_group_wps.reshape(n_slots, max_wp)
+    new_ghost_ts = new_group_ts.reshape(n_slots, max_wp)
+
+    return new_n_ghosts, new_excluded, new_car_ids, new_ghost_wps, new_ghost_ts
+
+
 def create_ghost_group(
     pre_state, next_state, canonical_car, cf_car,
     write_a, write_b, threshold_a,
@@ -531,7 +662,7 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         super().__init__(n_cars=n_cars, n_nodes=n_nodes, n_events=n_events)
 
     def _ghost_step(self, state, params, canonical_car, canonical_found, threshold):
-        """Run ghost trigger checks and expiry. Returns updated ghost fields and trigger info."""
+        """Run ghost trigger checks, growth, and expiry. Returns updated ghost fields and trigger info."""
         event = state.event
         max_groups = params.max_groups
         mpg = params.max_ghosts_per_group
@@ -549,6 +680,18 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             params.max_active_trips, max_groups, mpg,
         )
 
+        # Grow groups: add ghosts for newly divergent cars on trigger
+        new_group_n_ghosts, new_group_excluded, new_group_car_ids, new_ghost_wps, new_ghost_ts = (
+            grow_group_on_trigger(
+                state.waypoints, state.times,
+                new_ghost_wps, new_ghost_ts,
+                state.group_n_ghosts, state.group_excluded_cars, state.group_ghost_car_ids,
+                triggered, cf_cars, cf_founds,
+                canonical_car, canonical_found,
+                params.distances, event, params.max_active_trips, max_groups, mpg,
+            )
+        )
+
         # Expire old groups
         group_active = expire_groups(state, event.t, params.ghost_max_lifespan)
 
@@ -564,7 +707,11 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             "step": state.time,
         }
 
-        return new_ghost_wps, new_ghost_ts, group_active, ghost_info
+        return (
+            new_ghost_wps, new_ghost_ts, group_active,
+            new_group_n_ghosts, new_group_excluded, new_group_car_ids,
+            ghost_info,
+        )
 
     def step_env(
         self,
@@ -643,10 +790,12 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         params: EnvParams,
         threshold: float = 0.0,
     ) -> Tuple[chex.Array, EnvState, jnp.ndarray, jnp.ndarray, Dict[Any, Any]]:
-        # Ghost step: check triggers, update, expire
-        new_ghost_wps, new_ghost_ts, group_active, ghost_info = self._ghost_step(
-            state, params, jnp.int32(-1), jnp.bool_(False), threshold,
-        )
+        # Ghost step: check triggers, update, grow, expire
+        (
+            new_ghost_wps, new_ghost_ts, group_active,
+            new_group_n_ghosts, new_group_excluded, new_group_car_ids,
+            ghost_info,
+        ) = self._ghost_step(state, params, jnp.int32(-1), jnp.bool_(False), threshold)
 
         key, event_key = jax.random.split(state.key)
         next_event = rs.get_random_event(event_key, params.events, state.event.t)
@@ -660,9 +809,9 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             group_birth_time=state.group_birth_time,
             group_active=group_active,
             group_threshold=state.group_threshold,
-            group_n_ghosts=state.group_n_ghosts,
-            group_excluded_cars=state.group_excluded_cars,
-            group_ghost_car_ids=state.group_ghost_car_ids,
+            group_n_ghosts=new_group_n_ghosts,
+            group_excluded_cars=new_group_excluded,
+            group_ghost_car_ids=new_group_car_ids,
             group_write_idx=state.group_write_idx,
             ghost_waypoints=new_ghost_wps,
             ghost_times=new_ghost_ts,
@@ -700,10 +849,12 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
         params: EnvParams,
         threshold: float = 0.0,
     ) -> Tuple[chex.Array, EnvState, jnp.ndarray, jnp.ndarray, Dict[Any, Any]]:
-        # Ghost trigger checks and updates on existing ghosts
-        new_ghost_wps, new_ghost_ts, group_active, ghost_info = self._ghost_step(
-            state, params, canonical_car, jnp.bool_(True), threshold,
-        )
+        # Ghost trigger checks, updates on existing ghosts, and group growth
+        (
+            new_ghost_wps, new_ghost_ts, group_active,
+            new_group_n_ghosts, new_group_excluded, new_group_car_ids,
+            ghost_info,
+        ) = self._ghost_step(state, params, canonical_car, jnp.bool_(True), threshold)
 
         # Execute canonical dispatch
         (
@@ -735,9 +886,9 @@ class RidesharePoolDispatch(rs.RideshareDispatch):
             group_birth_time=state.group_birth_time,
             group_active=group_active,
             group_threshold=state.group_threshold,
-            group_n_ghosts=state.group_n_ghosts,
-            group_excluded_cars=state.group_excluded_cars,
-            group_ghost_car_ids=state.group_ghost_car_ids,
+            group_n_ghosts=new_group_n_ghosts,
+            group_excluded_cars=new_group_excluded,
+            group_ghost_car_ids=new_group_car_ids,
             group_write_idx=state.group_write_idx,
             ghost_waypoints=new_ghost_wps,
             ghost_times=new_ghost_ts,
