@@ -459,6 +459,19 @@ DN-ghost's B=0.3 mean is less biased but its SD (12.7) is larger than |ATE|.
   bases (zone × trip count × busy bucket) and features for the second
   trip's route.
 
+### Small-ATE follow-up (2026-10-08, part 2)
+See `LSTD_DQ_REPORT.md` Part 2 for the full table. In short:
+- ATE(B) with A=0 peaks around B=0.3 and crosses zero at B≈0.50. Past 0.5, λ(p) is strongly convex and
+  DQ's estimand no longer tracks the ATE.
+- Paper-level ATEs in the linear regime: B=0.01 (+0.40%) with A=0; threshold pairs 0.3:0.35 (−0.53%),
+  0.4:0.45 (−1.84%), 0.4:0.5 (−4.43%), 0.35:0.5 (−5.55%).
+- DQ(λ) wins when A=0. Pure LSTD wins for the threshold pairs. Nothing works near B=0.5. The gap between
+  DQ(λ) and pure LSTD is about −0.12×Naive in every regime, so DQ(λ)'s earlier wins were partly error
+  cancellation. The long-horizon value function is the real bottleneck.
+- TSRI fails (Naive-like). OPE is pending.
+- Tools: `scripts/lambda_p.py` accepts `A:B`; `scripts/summarize_lstd.py` accepts `A:B` and prints
+  DQ's estimand.
+
 ## Run log (from 2026-10-08, LSTD-DQ work)
 
 | Job ID | Spec | Purpose / overrides | Output |
@@ -474,3 +487,14 @@ DN-ghost's B=0.3 mean is less biased but its SD (12.7) is larger than |ATE|.
 | silky-stoic-woodlouse-of-wizardry | xp_gym `vast/lstd.yaml` (STBS="0.1 0.2 0.3") | held-out eval of `PoolLSTDDQEstimator` (zones, γ=1, ridge 1e-6, traces 0/.5/.8/.9/.95, jackknife 5 blocks) + naive; config `lstd_expts`, seed 42, 25 envs × 2 trials, 500k, no ghosts | `s3://research/dq/lstd/silky-stoic-woodlouse-of-wizardry/lstd_stb{s}.csv` |
 | prophetic-victorious-bullfrog-from-pluto | xp_gym `vast/dq-stb0.2.yaml` | DN-ghost (+naive, dn_network_1000) at B=0.2: max_groups=1000, 16/group, lifespan 2500, **num_trials=1** (25 envs), seed 42 | `s3://research/dq/prophetic-victorious-bullfrog-from-pluto` |
 | innocent-cuddly-raven-of-enrichment | xp_gym `vast/dq-stb0.3.yaml` | same at B=0.3 | `s3://research/dq/innocent-cuddly-raven-of-enrichment` |
+| inscrutable-topaz-guppy-from-venus / loud-origami-cuscus-of-artistry | xp_gym `vast/lambda-scan.yaml` / `lambda-scan2.yaml` | λ(p) scan for small-ATE targets: 64 envs × 500k, p∈{.3,.7,1} (p=0 reused from lambda_stb0.5, same keys), B∈{.4,.45,.55,.6} / {.65,.7,.75,.8} | `s3://research/dq/lambda/lambda_stb{B}.csv` |
+| tiny-jellyfish-of-great-certainty | xp_gym `vast/ate-precise.yaml` | precise truth at small-ATE thresholds B∈{.497,.518,.571}: 256 envs × 500k, p∈{0,.3,.7,1} | `s3://research/dq/ate2/ate_stb{B}.csv` |
+| demonic-neat-axolotl-of-unity / bizarre-talented-pudu-of-virtuosity | xp_gym `vast/lstd-small-a.yaml` / `lstd-small-b.yaml` | LSTD eval (config `lstd_expts`, seed 42, 50 envs, traces 0/.5/.8/.9/.95/.97) at B∈{.497,.518} / {.571}, targeting ATE ≈ +0.5%, −0.9%, −5% of avg reward | `s3://research/dq/lstd/<job>/lstd_stb{B}.csv` |
+| unnatural-shellfish-of-necessary-economy | xp_gym `vast/lambda-small-b.yaml` | λ(p) scan near B=0: 128 envs × 500k, p=0 once (`ate_p0_E128.csv`) then p∈{.3,.7,1} for B∈{.005,.01,.02,.03,.05} | `s3://research/dq/ate2/ate_stb{B}.csv`, `ate_p0_E128.csv` |
+| casual-warping-bullmastiff-of-admiration | xp_gym `vast/ope.yaml` (STBS="0.1 0.2 0.3") | OPE (LSTD/Diff-GQ1/differential TD, cf & IS, reg grids + CV selection), config `ope_tsr_expts`, seed 42, 50 envs, paired with silky-stoic | `s3://research/dq/ope/<job>/ope_stb{B}.csv` |
+| simple-expert-stallion-of-acceptance | xp_gym `vast/tsri.yaml` (STBS="0.1 0.2 0.3") | TSR design + TSRN/CR/LR/TSRI-1/2 (β grid), a_C=a_L=0.5 and market-balance eq. (26) | `s3://research/dq/tsri/<job>/tsri_stb{B}_{ac0.5_al0.5,mb1}.csv` |
+| miraculous-deer-of-sudden-storm | xp_gym `vast/lstd-small-c.yaml` | LSTD eval (config `lstd_expts`, seed 42, 50 envs, traces 0/.5/.8/.9/.95/.97) at B∈{.01,.02,.005} (near-zero ATE) | `s3://research/dq/lstd/miraculous-deer-of-sudden-storm/lstd_stb{B}.csv` |
+| spectral-invincible-tench-of-protection | xp_gym `vast/lambda-pairs.yaml` | λ(p) for threshold pairs A:B ∈ {.4:.45, .4:.5, .3:.35, .3:.4, .45:.5, .35:.5}, 64 envs × 500k, p∈{0,.3,.7,1} (negative small ATEs in the near-linear regime) | `s3://research/dq/lambda/lambda_pair{A:B}.csv` |
+| provocative-humble-stork-of-protection / bright-manipulative-dogfish-of-music | xp_gym `vast/lstd-pairs-a.yaml` / `lstd-pairs-b.yaml` | LSTD eval (config `lstd_expts`, seed 42, 50 envs, traces 0/.5/.8/.9/.95/.97) at A:B ∈ {.3:.35, .4:.5} / {.4:.45, .35:.5} (negative ATEs −0.56%…−5.55%) | `s3://research/dq/lstd/<job>/lstd_pair{A:B}.csv` |
+| ~~perky-magnificent-lion-of-wind~~ (failed to provision) → brainy-discerning-peccary-of-education | xp_gym `vast/ate-pairs.yaml` | precise truth, 256 envs × 500k, p∈{0,1}, A:B ∈ {.3:.35, .4:.45} | `s3://research/dq/ate2/ate_pair{A:B}.csv` |
+| sociable-dancing-cuttlefish-of-respect | xp_gym `vast/ope-0.1.yaml` | rerun of OPE at B=0.1 (casual-warping's B=0.1 failed at startup: GitHub download timeout) | `s3://research/dq/ope/sociable-dancing-cuttlefish-of-respect/ope_stb0.1.csv` |

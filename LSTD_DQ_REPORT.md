@@ -204,3 +204,72 @@ DQ(λ=0.9) is ahead of DN-ghost at every horizon.
   - DN-ghost: `smooth-aquatic-mastiff` (B=0.1), `prophetic-victorious-bullfrog-from-pluto`
     (B=0.2), `innocent-cuddly-raven-of-enrichment` (B=0.3)
   - Diagnostics and dev data: `dq/lambda/`, `dq/fork/`, `dq/collect2/`
+
+---
+
+# Part 2: small ATEs (paper levels −5%, −0.9%, +0.5% of average reward)
+
+*Run configs are logged in `PROJECT_SUMMARY.md`. The truth for each setting comes from CRN λ(p) sweeps:
+64 envs, plus 128–256 envs at the smallest effects. Every estimator run uses seed 42, 50 envs and 500k steps.*
+
+## Finding settings with small ATEs
+
+With arm A fixed at threshold 0, the ATE as a function of B (see `ate_vs_B.png`) rises to about +6.8% at
+B=0.3, crosses zero at B≈0.50 and falls steeply after that. This gives three ways to reach the paper's levels:
+
+1. **B near 0.5 (A=0).** B=0.497, 0.518 and 0.571 give +0.6%, −0.76% and −4.9%. Average reward
+   λ(p) is **strongly convex** here: almost all the drop happens between p=0.7 and p=1. As a result, DQ's
+   own estimand λ′(0.5) is far from the ATE (+1.75 vs +0.69, +0.85 vs −0.86, −1.82 vs −5.53). Even a
+   perfect DQ estimator would be badly biased, and at −0.76% it would have the wrong sign.
+2. **B near 0 (A=0).** B=0.005, 0.01 and 0.02 give +0.15%, +0.40% and +0.82%. λ(p) is linear, so DQ's
+   estimand equals the ATE. Only about 1–2% of decisions differ between arms. This regime only gives
+   positive ATEs.
+3. **Threshold pairs, both nonzero.** A:B = 0.3:0.35, 0.4:0.45, 0.4:0.5 and 0.35:0.5 give −0.53%, −1.84%,
+   −4.43% and −5.55%. λ(p) is linear for all of them (DQ estimand within ±0.2 of the ATE). This is the
+   clean way to get negative small ATEs.
+
+## Results
+
+Each cell is mean ± SD / RMSE / % of envs with the right sign. "Pure" is λ=0 paired LSTD-DQ, JK is the
+block jackknife, and tr is DQ(λ). The % column is relative to λ(0) of arm A.
+
+| A:B | ATE (%) | DQ estimand | Naive | Pure LSTD | Pure + JK | DQ(λ=0.9) | DQ(λ=0.8) + JK |
+|---|---|---|---|---|---|---|---|
+| 0:0.005 | 0.17 (+0.15%) | 0.24 | −1.71±0.08 / 1.88 / 0% | −0.20±0.09 / 0.38 / 0% | −0.09±0.11 / 0.28 / 24% | 0.00±0.30 / 0.34 / 52% | 0.07±0.25 / 0.27 / 64% |
+| 0:0.01 | 0.46 (+0.40%) | 0.36 | −3.96±0.12 / 4.41 / 0% | −0.29±0.22 / 0.78 / 10% | −0.04±0.27 / 0.56 / 48% | 0.27±0.54 / 0.57 / 66% | 0.35±0.45 / 0.46 / 74% |
+| 0:0.02 | 0.93 (+0.82%) | 0.94 | −8.59±0.16 / 9.51 / 0% | −0.56±0.45 / 1.55 / 10% | 0.02±0.49 / 1.03 / 54% | 0.73±0.89 / 0.91 / 84% | 0.96±0.78 / 0.78 / 90% |
+| 0:0.1 | 4.43 (+3.90%) | 4.65 | −44.18±0.41 / 48.61 / 0% | −1.33±2.03 / 6.11 / 32% | 1.84±2.50 / 3.60 / 82% | **4.50±1.79 / 1.79 / 100%** | 6.07±2.09 / 2.66 / 100% |
+| 0.3:0.35 | −0.65 (−0.53%) | −0.65 | −22.49±0.28 / 21.84 / 100% | **−0.48±1.43 / 1.44 / 58%** | 1.46±1.60 / 2.65 / 20% | 1.86±1.47 / 2.91 / 12% | 2.97±1.62 / 3.96 / 4% |
+| 0.4:0.45 | −2.20 (−1.84%) | −2.29 | −23.23±0.24 / 21.03 / 100% | **−1.75±1.47 / 1.54 / 86%** | 0.13±1.66 / 2.86 / 48% | 0.97±1.83 / 3.66 / 24% | 2.04±1.85 / 4.62 / 16% |
+| 0.4:0.5 | −5.29 (−4.43%) | −5.18 | −46.87±0.36 / 41.59 / 100% | **−4.55±2.84 / 2.94 / 94%** | −0.62±3.22 / 5.67 / 66% | 1.31±2.96 / 7.23 / 36% | 3.43±3.24 / 9.30 / 12% |
+| 0.35:0.5 | −6.70 (−5.55%) | −6.86 | −68.59±0.40 / 61.89 / 100% | **−5.48±4.28 / 4.45 / 90%** | 0.65±5.25 / 9.03 / 44% | 2.60±4.03 / 10.14 / 32% | 6.29±4.75 / 13.83 / 10% |
+| 0:0.497 | 0.69 (+0.60%) | 1.75 | −179.32±0.77 / 180.0 / 0% | −17.75±9.85 / 20.90 / 6% | −5.44±11.63 / 13.14 / 30% | 5.30±8.74 / 9.88 / 72% | 10.51±10.80 / 14.60 / 82% |
+| 0:0.518 | −0.86 (−0.76%) | 0.85 | −184.59±0.61 / 183.7 / 100% | −18.22±9.49 / 19.78 / 96% | −4.88±11.26 / 11.96 / 70% | 5.24±8.54 / 10.49 / 26% | 11.30±10.42 / 16.02 / 12% |
+| 0:0.571 | −5.53 (−4.86%) | −1.82 | −197.03±0.76 / 191.5 / 100% | −20.11±11.04 / 18.29 / 98% | −5.58±13.48 / 13.48 / 66% | 4.98±9.69 / 14.29 / 30% | 11.75±12.08 / 21.08 / 18% |
+
+## What it shows
+
+- **No single LSTD variant works in every regime.**
+  - With A=0 and small B, DQ(λ) works. It meets the bias goal everywhere except the very smallest
+    effect, and it gets the right sign 66–100% of the time, limited by noise.
+  - With both thresholds nonzero, **pure LSTD** works: bias +14% to +27%, RMSE 14–33× below Naive,
+    right sign 58–94%. DQ(λ) and the jackknife push it the wrong way.
+  - Near B=0.5, nothing works. Naive is about −190, i.e. 30–250× the ATE, and DQ's estimand is biased
+    by the curvature.
+- **Why DQ(λ) isn't a reliable fix.** The gap between DQ(λ=0.9) and pure LSTD is about −0.12×Naive in
+  every regime (+5.8 at 0:0.1; +2.3, +2.7 and +8.1 for the pairs). As λ→1 the estimate levels off
+  near the truth when A=0, but at **+2.5 to +3.7** for the pairs, where the truth is −5 to −7.
+  - The trace replaces the LSTD value only over about 1/(1−λ) ≤ 30 requests. The fork oracle shows the
+    payback from a pooling decision takes hundreds to ~1000 requests, so the long tail still comes from
+    the LSTD value function.
+  - That value function's error has a different sign in each regime. At A=0 the trace happened to
+    cancel it; for the pairs it adds to it.
+  - The bottleneck is still the **value function's long-horizon accuracy**. DQ(λ) gave the earlier
+    B=0.1–0.3 results partly by cancelling errors.
+- **TSRI** (Johari et al. 2020; job simple-expert-stallion-of-acceptance) fails at B=0.1, 0.2 and 0.3.
+  This holds with a_C=a_L=0.5 and with the paper's market-balance design, for every β.
+  - The closest variant (LR, market-balance design) is −10.5±13.7 at B=0.1, where the truth is +4.4.
+  - Every TSRI-1/2 variant has the wrong sign in ≥80% of envs.
+  - Two-sided randomization targets competition between customers and listings at one moment. Here
+    the interference runs through fleet state over time, which TSR doesn't address.
+- **OPE** (off-policy LSTD/GTD/TD with regularization grids): pending.
