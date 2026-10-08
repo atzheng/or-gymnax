@@ -272,4 +272,20 @@ block jackknife, and tr is DQ(λ). The % column is relative to λ(0) of arm A.
   - Every TSRI-1/2 variant has the wrong sign in ≥80% of envs.
   - Two-sided randomization targets competition between customers and listings at one moment. Here
     the interference runs through fleet state over time, which TSR doesn't address.
-- **OPE** (off-policy LSTD/GTD/TD with regularization grids): pending.
+- **OPE** (ATE = ρ̂_B − ρ̂_A, off-policy average reward with zone features; `xp_gym/estimators/ope_pool.py`;
+  jobs sociable-dancing-cuttlefish-of-respect for B=0.1 and casual-warping-bullmastiff-of-admiration for
+  B=0.2) **does no better than pure LSTD-DQ, even with oracle tuning.** Best grid value per family:
+
+  | B (ATE) | OPE-LSTD, ridge 1e-8 (= GTD fixed point, η→0) | OPE-LSTD, CV-selected | differential TD, best α | Diff-GQ1 online, best α | pure LSTD-DQ | Naive |
+  |---|---|---|---|---|---|---|
+  | 0.1 (4.43) | −2.55±2.26 / RMSE 7.3 / 12% | −21.9 / 26.4 / 0% | −18.3 / 22.8 / 0% | −40.7 / 45.1 / 0% | −1.33 / 6.1 / 32% | −44.2 / 48.6 |
+  | 0.2 (7.23) | −5.70±3.92 / 13.5 / 6% | −43.2 / 50.5 / 0% | −36.9 / 44.2 / 0% | −77.9 / 85.1 / 0% | −2.60 / 10.6 / 24% | −84.6 / 91.8 |
+
+  - The tuned optimum is always the least regularization. Bigger ridge shrinks θ toward 0, which gives
+    the immediate-reward difference, i.e. Naive.
+  - Block-CV on the projected Bellman error picks ridge ≈ 0.01, which is far too much.
+  - Online TD and GTD barely move away from θ=0 in 500k steps, and larger step sizes diverge.
+  - The counterfactual and importance-sampling versions agree to within noise.
+  - Unregularized OPE-LSTD is essentially pure LSTD-DQ with a separate θ per arm. It has the same
+    projection bias and a bit more variance.
+  - B=0.3 died with its machine and wasn't rerun.

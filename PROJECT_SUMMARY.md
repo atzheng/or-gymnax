@@ -468,7 +468,8 @@ See `LSTD_DQ_REPORT.md` Part 2 for the full table. In short:
 - DQ(λ) wins when A=0. Pure LSTD wins for the threshold pairs. Nothing works near B=0.5. The gap between
   DQ(λ) and pure LSTD is about −0.12×Naive in every regime, so DQ(λ)'s earlier wins were partly error
   cancellation. The long-horizon value function is the real bottleneck.
-- TSRI fails (Naive-like). OPE is pending.
+- TSRI fails (Naive-like). OPE (LSTD/GTD/TD) is no better than pure LSTD-DQ even at the oracle-best
+  regularization (the smallest). CV over-regularizes, and online TD/GTD under-train.
 - Tools: `scripts/lambda_p.py` accepts `A:B`; `scripts/summarize_lstd.py` accepts `A:B` and prints
   DQ's estimand.
 
@@ -491,7 +492,7 @@ See `LSTD_DQ_REPORT.md` Part 2 for the full table. In short:
 | tiny-jellyfish-of-great-certainty | xp_gym `vast/ate-precise.yaml` | precise truth at small-ATE thresholds B∈{.497,.518,.571}: 256 envs × 500k, p∈{0,.3,.7,1} | `s3://research/dq/ate2/ate_stb{B}.csv` |
 | demonic-neat-axolotl-of-unity / bizarre-talented-pudu-of-virtuosity | xp_gym `vast/lstd-small-a.yaml` / `lstd-small-b.yaml` | LSTD eval (config `lstd_expts`, seed 42, 50 envs, traces 0/.5/.8/.9/.95/.97) at B∈{.497,.518} / {.571}, targeting ATE ≈ +0.5%, −0.9%, −5% of avg reward | `s3://research/dq/lstd/<job>/lstd_stb{B}.csv` |
 | unnatural-shellfish-of-necessary-economy | xp_gym `vast/lambda-small-b.yaml` | λ(p) scan near B=0: 128 envs × 500k, p=0 once (`ate_p0_E128.csv`) then p∈{.3,.7,1} for B∈{.005,.01,.02,.03,.05} | `s3://research/dq/ate2/ate_stb{B}.csv`, `ate_p0_E128.csv` |
-| casual-warping-bullmastiff-of-admiration | xp_gym `vast/ope.yaml` (STBS="0.1 0.2 0.3") | OPE (LSTD/Diff-GQ1/differential TD, cf & IS, reg grids + CV selection), config `ope_tsr_expts`, seed 42, 50 envs, paired with silky-stoic | `s3://research/dq/ope/<job>/ope_stb{B}.csv` |
+| casual-warping-bullmastiff-of-admiration | xp_gym `vast/ope.yaml` (STBS="0.1 0.2 0.3"); B=0.1 failed at startup (GitHub timeout), B=0.3 died mid-run (instance lost); only B=0.2 output | OPE (LSTD/Diff-GQ1/differential TD, cf & IS, reg grids + CV selection), config `ope_tsr_expts`, seed 42, 50 envs, paired with silky-stoic | `s3://research/dq/ope/<job>/ope_stb{B}.csv` |
 | simple-expert-stallion-of-acceptance | xp_gym `vast/tsri.yaml` (STBS="0.1 0.2 0.3") | TSR design + TSRN/CR/LR/TSRI-1/2 (β grid), a_C=a_L=0.5 and market-balance eq. (26) | `s3://research/dq/tsri/<job>/tsri_stb{B}_{ac0.5_al0.5,mb1}.csv` |
 | miraculous-deer-of-sudden-storm | xp_gym `vast/lstd-small-c.yaml` | LSTD eval (config `lstd_expts`, seed 42, 50 envs, traces 0/.5/.8/.9/.95/.97) at B∈{.01,.02,.005} (near-zero ATE) | `s3://research/dq/lstd/miraculous-deer-of-sudden-storm/lstd_stb{B}.csv` |
 | spectral-invincible-tench-of-protection | xp_gym `vast/lambda-pairs.yaml` | λ(p) for threshold pairs A:B ∈ {.4:.45, .4:.5, .3:.35, .3:.4, .45:.5, .35:.5}, 64 envs × 500k, p∈{0,.3,.7,1} (negative small ATEs in the near-linear regime) | `s3://research/dq/lambda/lambda_pair{A:B}.csv` |
