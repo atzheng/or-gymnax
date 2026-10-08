@@ -456,7 +456,7 @@ DN-ghost's B=0.3 mean is less biased but its SD (12.7) is larger than |ATE|.
   method. Choosing λ in a principled way is open; λ=0.9 was picked on dev seed 0 and
   held up on seed 42.
 - The pure-LSTD projection bias still needs better features. Untried: per-car attribute
-  bases (zone × trip count × busy bucket), coarser zones, and features for the second
+  bases (zone × trip count × busy bucket) and features for the second
   trip's route.
 
 ## Run log (from 2026-10-08, LSTD-DQ work)
