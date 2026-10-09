@@ -289,3 +289,162 @@ block jackknife, and tr is DQ(λ). The % column is relative to λ(0) of arm A.
   - Unregularized OPE-LSTD is essentially pure LSTD-DQ with a separate θ per arm. It has the same
     projection bias and a bit more variance.
   - B=0.3 died with its machine and wasn't rerun.
+
+---
+
+# Part 3: one A, three B values near it; improving DQ
+
+*2026-10-09. Code: xp_gym `ghosts` (`xp_gym/estimators/fork_dq_pool.py`, `tests/test_fork_dq_pool.py`,
+`scripts/config/fork_expts.yaml`, `scripts/offline/`). Every job is in the run log in `PROJECT_SUMMARY.md`.*
+
+## Choosing A
+
+f(s) is the average reward when every request uses savings threshold s. We have ATE(A,B) = f(B) − f(A), with the
+percentages relative to f(A). I scanned f(s) on a 0.025 grid with 128 envs (`f_curve.png`). f rises to a peak of about 121.7
+near s≈0.275, then falls more and more steeply.
+
+- **Negative effects (−0.9%, −5%)** need a B above A on the falling side.
+- **The positive effect (+0.5%)** needs a B with f(B) about 0.6 higher than f(A). That is only possible if A is at least
+  0.6 below the peak. The smallest A on the 0.05 grid that allows this is **A = 0.35**.
+
+| A:B | ATE | % of f(A) | DQ estimand λ′(0.5) | Naive (dev) |
+|---|---|---|---|---|
+| 0.35:0.31 | +0.58 ± 0.04 | **+0.48%** | 0.52 ± 0.11 | +18.1 |
+| 0.35:0.39 | −1.05 ± 0.05 | **−0.87%** | −1.05 ± 0.12 | −18.2 |
+| 0.35:0.49 | −6.02 ± 0.05 | **−4.98%** | −5.75 ± 0.13 | −63.7 |
+
+Truth comes from 128-env CRN λ(p) runs at p ∈ {0, .3, .7, 1}. λ(p) is close to linear in all three settings, so DQ's
+estimand matches the ATE.
+
+⚠️ **Naive has the right sign in all three settings.** Naive is the immediate reward difference. Near A=0.35, pooling
+more (a lower threshold) helps both immediately and in the long run, so Naive's sign agrees with the truth. Naive is still
+off by 30–17× in magnitude. These settings can therefore show the RMSE and bias goals, but **not** "DQ gets the sign right
+where Naive doesn't". Only the A=0 settings show that.
+
+## Why pure LSTD's value function is hard to improve (offline, dev data)
+
+All tests use dev seed 0, 8 envs per setting. Most used the A=0, B ∈ {0.1, 0.2, 0.3} datasets; the A=0.35 dev sets were
+collected later. To separate finite-sample bias from feature (projection) bias, I fitted θ on 1, 2, 4, 8 and 16 pooled
+half-envs and evaluated on every env (`scripts/offline/fs*.py`).
+
+- **Most of the A=0 bias is finite-sample, and it shrinks slowly**, roughly like 1/√n rather than 1/n. That is why the
+  1/n block jackknife only half-fixes it. At B=0.1 with 63 zones, the estimate is −2.6 at half an env, −0.2 at one env,
+  1.0 / 1.7 / 2.2 at 2 / 4 / 8 envs, against truth 4.65.
+- **Spatial resolution is a real trade-off.** Coarser zones (4/8/16/32 k-means regions, or 16/32 smooth graph-Laplacian
+  bases) have less finite-sample bias but level off lower. With only the 3 trip-count features, the estimate is −4.3 at any
+  amount of data.
+- **Every feature I added made things worse, even with pooled data:**
+  - time of day (Fourier terms, demand rate, and their interactions with zone counts);
+  - square-root or squared counts;
+  - per-zone supply;
+  - total busy time. This one sends the estimate to about 0.4 × Naive (−17 at B=0.1) at any amount of data.
+- **Other fixes to the fit also failed:**
+  - LSTD(λ_v) toward Monte Carlo: −6 to −90 at B=0.1, even pooled;
+  - discounting with γ ∈ {0.998, 0.999, 0.9995};
+  - averaging the next state over the coin flip;
+  - time-block fixed effects in the value function: numerically unstable;
+  - a time-block-varying average reward: shorter blocks push the estimate toward Naive.
+
+  **Interpretation:** the long-horizon value gap is identified only from slow variation, on the scale of hours. That is
+  exactly where fleet features are confounded with the 24× daily and 5× weekly swings in demand. Richer or
+  more Monte-Carlo-like fits pick up that confounding instead of what a car is worth.
+- **At A=0.35 the sign of LSTD's bias from features flips.** With pooled θ, the bias is about −8% of Naive, versus
+  +5.5% at A=0. Per-env θ has a finite-sample bias in the opposite direction, which roughly cancels it. So pure LSTD
+  looks good at A=0.35 partly by luck, just as DQ(λ) did at A=0.
+
+## A new DQ variant: fork-DQ (n-step paired DQ with counterfactual replay)
+
+Linear value features couldn't be fixed, so the next step was to stop relying on the value function for the first H steps
+after a decision.
+
+- **Forks.** At each step where the arms would dispatch differently, `ForkDQEstimator` opens a fork: the fleet in which
+  the *other* arm acted. It is stored sparsely, as up to K ghost copies of the cars that diverge.
+- **Replay.** The fork is replayed on the **observed** requests and the **observed** later coin flips, using the known
+  greedy dispatch rule. This needs the dispatch rule and the request log, which a platform has, but no extra randomness.
+  So the per-step reward difference between the two worlds is exact.
+- **Estimate.** At age H, the remaining effect is bootstrapped with the same LSTD value:
+  Δ_t(H) = Σ_{k<H}(r_{t+k} − r^fork_{t+k}) + U(y_{t+H−1}) − U(y^fork_{t+H−1}), and fork_H = Σ_t s_t Δ_t(H) / T.
+  - H=1 is exactly pure (paired) LSTD-DQ, and the code checks this.
+  - Forks that need more than K ghosts are closed early and bootstrapped at that age.
+  - Ghosts that become identical to the real car are dropped.
+- **Test.** `tests/test_fork_dq_pool.py` matches brute-force forked env rollouts exactly for H ∈ {1, 5, 20}: both the reward
+  sums and the bootstrap features.
+- **Cost.** With 192 fork slots and 64 ghosts, a run takes about 28 s per 10k steps for 25 envs, about 25 GPU-minutes per
+  50-env setting. Forks average about 10 ghosts. About 9% overflow, at mean age about 840.
+
+### Dev results (seed 0, 50 envs; truth = DQ estimand)
+
+Each cell is mean ± SD / RMSE.
+
+| A:B (truth) | Pure LSTD (= fork H1) | fork H10 | fork H100 | fork H300 | **fork H1000** | DQ(λ=0.9) | Naive |
+|---|---|---|---|---|---|---|---|
+| 0.35:0.31 (+0.52) | 0.70±0.98 / 1.00 | −2.02±0.76 / 2.65 | −1.47±0.42 / 2.03 | −0.24±0.36 / 0.85 | 1.46±0.65 / 1.14 | −1.44±1.43 / 2.42 | 18.10 / 17.6 |
+| 0.35:0.39 (−1.05) | −0.80±1.22 / 1.24 | 1.90±0.91 / 3.10 | 1.47±0.54 / 2.58 | 0.25±0.38 / 1.36 | −1.72±0.72 / 0.98 | 1.30±1.39 / 2.74 | −18.23 / 17.2 |
+| 0.35:0.49 (−5.75) | −4.77±4.41 / 4.51 | 4.95±3.61 / 11.3 | 4.56±1.88 / 10.5 | 0.82±1.02 / 6.65 | −7.89±1.67 / 2.72 | 2.80±4.49 / 9.65 | −63.71 / 58.0 |
+
+- **Forks cut the SD a lot**: to about ⅓–½ of pure LSTD at large H.
+- **The mean is not monotone in H.** At H=10–100 it is pushed *against* Naive's direction by about 12–15% of Naive. So the
+  LSTD value gap between two fleets that differ in about 10 cars is badly calibrated. It comes back by H=300–1000.
+- **I pre-registered H=1000** (no jackknife) as the lowest summed dev RMSE: 4.8, versus 6.8 for pure LSTD. Its remaining
+  bias leans in Naive's direction by about 3–5% of Naive in all three settings.
+
+### Held-out results (seed 42, 50 envs; truth = ATE)
+
+Each cell is mean ± SD / bias % / RMSE / right-sign %.
+
+| A:B (ATE) | Naive | Pure LSTD | Pure + JK | DQ(λ=0.9) | **fork H1000** | fork H300 |
+|---|---|---|---|---|---|---|
+| 0.35:0.31 (+0.58) | 18.16±0.22 / +3032% / 17.6 / 100% | 0.30±1.11 / −48% / 1.15 / 58% | −1.30±1.25 / −323% / 2.25 / 14% | −1.82±1.35 / −414% / 2.75 / 8% | 1.50±0.74 / **+159%** / 1.18 / 96% | −0.29±0.35 / −151% / 0.94 / 20% |
+| 0.35:0.39 (−1.05) | −18.20±0.22 / −1638% / 17.2 / 100% | −0.95±1.20 / +9% / 1.21 / 82% | 0.54±1.36 / +152% / 2.09 / 24% | 1.01±1.43 / +196% / 2.50 / 20% | −1.69±0.68 / −61% / **0.94** / **98%** | 0.25±0.37 / +124% / 1.35 / 26% |
+| 0.35:0.49 (−6.02) | −63.67±0.45 / −957% / 57.7 / 100% | −5.34±4.83 / +11% / 4.88 / 88% | 0.13±5.58 / +102% / 8.30 / 46% | 2.32±4.90 / +139% / 9.68 / 32% | −8.01±1.35 / −33% / **2.40** / **100%** | 0.54±1.15 / +109% / 6.67 / 28% |
+
+- **Fork-DQ (H=1000) is the best estimator at −0.87% and −5%.**
+  - At −5%, it halves pure LSTD's RMSE (2.40 vs 4.88), with the right sign in 100% of envs vs 88%.
+  - At −0.87%, its RMSE is 0.94 vs 1.21, with the right sign 98% vs 82%.
+  - It is 18–24× below Naive in RMSE.
+- **At +0.48% it fails the bias goal (+159%).** Its RMSE ties pure LSTD (1.18 vs 1.15) and it has the right sign in 96% of
+  envs (pure LSTD: 58%). But its mean is 1.50 against truth 0.58.
+  - Its bias is about 5% of Naive in Naive's direction in every setting. The run below checks whether that is payback
+    arriving after 1000 steps.
+- **Pure LSTD meets all three goals here** (bias −48%, +9%, +11%; RMSE 15–17× below Naive). But its sign accuracy is
+  noise-limited: 58–88%. The offline analysis shows its small bias comes from two cancelling errors.
+- **Jackknife and DQ(λ) both hurt in every A=0.35 setting.** Their corrections assume the A=0 error pattern, which flips
+  sign here.
+- **The dev pick held up:** the held-out numbers are within noise of the dev numbers.
+
+### Why fork-DQ at H=1000 is still biased (job legendary-curious-chicken-of-reward)
+
+This dev run (seed 0, 0.35:0.31, truth +0.52) used 128 ghosts and H up to 3000. It also output the reward-only part of
+each fork (`forkmc_H`, with U=0).
+
+| H | 1 | 30 | 300 | 1000 | 2000 | 3000 |
+|---|---|---|---|---|---|---|
+| reward part only | 18.10 (= Naive) | 10.83 | 3.14 | 1.06 ± 0.63 | 0.72 ± 1.75 | 0.62 ± 2.13 |
+| fork-DQ (reward + LSTD tail) | 0.70 ± 0.98 | −2.01 | −0.24 | 1.49 ± 0.69 | 0.79 ± 2.00 | 0.82 ± 2.26 |
+
+- **Payback continues well past 1000 steps.** The exact reward difference keeps falling until about 3000, where it reaches
+  the truth. The fork oracle at A=0 had suggested about 1000.
+- **The LSTD tail term goes the wrong way.** At H=1000 it *adds* +0.43 when about −0.5 remains. At H=10–300 it
+  overcorrects. So LSTD's value is miscalibrated at every horizon, not only at H=1.
+- **Longer forks are close to unbiased but noisy.** H=2000–3000 have bias about +0.3 but SD about 2, and 83% of forks overflow
+  128 ghosts by age about 2100. The SD grows because the two fleets diverge chaotically.
+  - With this setting's tiny effect, H=1000 has the better RMSE (1.19 vs 2.0–2.3).
+  - Fixing the bias would need either a value function that is right about the slow tail, or many more ghosts and slots,
+    which costs a lot more compute.
+
+## Bottom line for Part 3
+
+- **At A=0.35, B ∈ {0.31, 0.39, 0.49}** (ATE +0.48%, −0.87%, −4.98%), the best DQ variants are:
+  - **fork-DQ H=1000** for the two negative effects. RMSE 0.94 and 2.40 (Naive 17.2, 57.7); bias −61% and −33%; right sign
+    in 98% and 100% of envs.
+  - **pure LSTD** for the +0.48% effect. RMSE 1.15 (Naive 17.6); bias −48%; right sign 58%. Fork-DQ's RMSE is the same,
+    1.18, and it has the right sign in 96% of envs, but its bias is +159%.
+- **What no longer works here:** DQ(λ) and the jackknife, the A=0 winners, are both worse than pure LSTD in all three settings.
+- **The main lesson:** the LSTD value function's error is the limiting factor, and the direction of that error depends on
+  the regime. Fork-DQ shrinks its weight a lot, but payback lasting about 3000 requests keeps a residual bias of about 3–5%
+  of Naive at an affordable horizon.
+- **Possible next steps:**
+  1. More ghosts and slots with H≈2000, run on a larger GPU budget.
+  2. Tail value features fitted on the forks themselves: forks give exact counterfactual pairs, i.e. labelled value
+     differences.
+  3. Repeat fork-DQ at A=0 (B=0.1–0.3), where Naive has the wrong sign.

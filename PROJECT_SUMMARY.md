@@ -473,6 +473,31 @@ See `LSTD_DQ_REPORT.md` Part 2 for the full table. In short:
 - Tools: `scripts/lambda_p.py` accepts `A:B`; `scripts/summarize_lstd.py` accepts `A:B` and prints
   DQ's estimand.
 
+### Part 3: A=0.35 settings and fork-DQ (2026-10-09)
+See `LSTD_DQ_REPORT.md` Part 3 and `f_curve.png`. In short:
+- **Settings.** A=0.35 is the smallest A (0.05 grid) that allows +0.5%, −0.9% and −5% with B near A:
+  - B=0.31: ATE +0.58 (+0.48%);
+  - B=0.39: ATE −1.05 (−0.87%);
+  - B=0.49: ATE −6.02 (−4.98%).
+
+  Truth is in `s3://research/dq/ate3/`. ⚠️ Naive has the right sign in all three.
+- **Value-function experiments (offline, dev).** Nothing fixed the long-horizon value gap. Time features, nonlinear counts,
+  busy time, fixed effects, a local average reward, LSTD(λ_v) and γ<1 all made it worse or unstable. Spatial resolution
+  trades finite-sample bias against feature bias.
+- **New estimator.** `xp_gym/estimators/fork_dq_pool.py:ForkDQEstimator` (fork-DQ) replays the other arm's fleet on the
+  observed requests and coin flips for H steps, then bootstraps with LSTD. It is verified exactly against brute-force forks
+  in `tests/test_fork_dq_pool.py`.
+- **Held-out results, fork-DQ H=1000** (pre-registered on dev):
+
+  | Setting | fork-DQ H=1000 | Pure LSTD |
+  |---|---|---|
+  | B=0.49 | RMSE 2.40, right sign 100% | RMSE 4.88, 88% |
+  | B=0.39 | RMSE 0.94, 98% | RMSE 1.21, 82% |
+  | B=0.31 | RMSE 1.18, bias +159% (fails the bias goal) | RMSE 1.15, 58% |
+
+  Pure LSTD meets all three goals here, but with a noisy sign. JK and DQ(λ) hurt in every A=0.35 setting.
+- Config `scripts/config/fork_expts.yaml`; job specs `vast/fork-a035-*.yaml`, `vast/fork-long.yaml`.
+
 ## Run log (from 2026-10-08, LSTD-DQ work)
 
 | Job ID | Spec | Purpose / overrides | Output |
@@ -499,3 +524,13 @@ See `LSTD_DQ_REPORT.md` Part 2 for the full table. In short:
 | provocative-humble-stork-of-protection / bright-manipulative-dogfish-of-music | xp_gym `vast/lstd-pairs-a.yaml` / `lstd-pairs-b.yaml` | LSTD eval (config `lstd_expts`, seed 42, 50 envs, traces 0/.5/.8/.9/.95/.97) at A:B ∈ {.3:.35, .4:.5} / {.4:.45, .35:.5} (negative ATEs −0.56%…−5.55%) | `s3://research/dq/lstd/<job>/lstd_pair{A:B}.csv` |
 | ~~perky-magnificent-lion-of-wind~~ (failed to provision) → brainy-discerning-peccary-of-education | xp_gym `vast/ate-pairs.yaml` | precise truth, 256 envs × 500k, p∈{0,1}, A:B ∈ {.3:.35, .4:.45} | `s3://research/dq/ate2/ate_pair{A:B}.csv` |
 | sociable-dancing-cuttlefish-of-respect | xp_gym `vast/ope-0.1.yaml` | rerun of OPE at B=0.1 (casual-warping's B=0.1 failed at startup: GitHub download timeout) | `s3://research/dq/ope/sociable-dancing-cuttlefish-of-respect/ope_stb0.1.csv` |
+| affable-blond-coua-of-reverence, elastic-friendly-starling-of-hurricane, merry-intelligent-jackalope-of-devotion, sexy-whimsical-skunk-of-diversity | xp_gym `vast/f-scan.yaml` | failed to provision (no A100_SXM4 host) | |
+| astonishing-cordial-woodlouse-of-greatness | xp_gym `vast/f-scan.yaml` (SS="0.2 0.25 ... 0.5") | destroyed while queued (redundant with 64-env λ files) | |
+| amber-kelpie-of-magic-anger | xp_gym `vast/f-scan2.yaml` (SS="0.225 0.275 0.325 0.375 0.425 0.475 0.525") | f(s)=avg reward of all-s policy, 128 envs × 500k, p=1, CRN keys shared with ate_p0_E128 | `s3://research/dq/fscan/f_s{s}_E128.csv` |
+| happy-spiffy-tarsier-of-acumen | xp_gym `vast/ate-a035.yaml` (STBS="0.31 0.39 0.49") | truth for A=0.35 pairs: 128 envs × 500k, p=0 once then p∈{.3,.7,1} | `s3://research/dq/ate3/ate_A0.35_p0_E128.csv`, `ate_pair0.35:{B}_E128.csv` |
+| successful-powerful-pug-of-judgment / curious-vivacious-ostrich-of-aptitude | xp_gym `vast/collect-a035.yaml` (PAIRS="0.35:0.31 0.35:0.39") / `collect-a035b.yaml` (0.35:0.49) | dev data seed 0, 8 envs, K=0 (234 superset features + dphi), collect_pool.py now takes A:B | `s3://research/dq/collect3/pair{A:B}_s0/` |
+| ancient-tremendous-bulldog-of-refinement / famous-fulmar-of-fascinating-influence / illustrious-electric-coua-of-piety | xp_gym `vast/lstd-a035-{0.31,0.39,0.49}.yaml` | baseline held-out LSTD eval (config `lstd_expts`, seed 42, 50 envs, zones, traces 0/.5/.8/.9/.95/.97, JK) at A:B = 0.35:0.31 / 0.35:0.39 / 0.35:0.49 | `s3://research/dq/lstd/<job>/lstd_pair0.35:{B}.csv` |
+| (illustrious-electric-coua-of-piety failed; 0.35:0.49 baseline covered by the fork runs) | | | |
+| outrageous-whimsical-mouflon-of-kindness / impressive-auk-of-fabulous-joviality | xp_gym `vast/fork-smoke.yaml` (PAIR=0.35:0.49; fork_ghosts 16 / 48) | ForkDQEstimator smoke: 25 envs × 30k steps, timing + ghost diagnostics (16 ghosts: 97% forks overflow; 48: overflow at mean age ~500) | `s3://research/dq/fork/<job>/smoke_pair0.35:0.49.csv` |
+| noble-precise-terrier-of-pluck / enlightened-glaring-myna-of-satiation / towering-flawless-vulture-of-triumph | xp_gym `vast/fork-a035-{0.49,0.39,0.31}.yaml` | ForkDQEstimator (config `fork_expts`: zones LSTD γ=1 ridge 1e-6, JK 5 blocks, traces 0/.5/.8/.9/.95/.97, fork H∈{1,10,30,100,300,1000}, 192 slots, 64 ghosts) + naive; seeds 0 (dev) and 42 (eval), 50 envs each | `s3://research/dq/fork/<job>/fork_pair0.35:{B}_seed{s}.csv` |
+| legendary-curious-chicken-of-reward | xp_gym `vast/fork-long.yaml` | ForkDQ dev (seed 0) at 0.35:0.31 with H∈{1,30,300,1000,2000,3000}, 128 ghosts, + reward-only forkmc_H outputs: is there payback beyond 1000 steps? | `s3://research/dq/forklong/<job>/` |
