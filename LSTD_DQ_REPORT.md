@@ -526,3 +526,57 @@ Dev numbers agree with held-out to within about 0.1–0.2 for every row.
   payback that lasts about an hour, not confounding.
 - **Exact Monte Carlo has the opposite problem.** It removes the bias, but the variance at the needed horizon is too
   large.
+
+# Part 5: A=0.2 with B below A
+
+Below the peak f rises with the threshold, so every B < A has a negative true effect. Naive is positive in every
+setting, so it has the wrong sign in all three.
+
+Truth from job phenomenal-archetypal-tarsier-of-hurricane, 128 envs:
+
+| A:B | ATE | % of f(A) | DQ estimand | Naive |
+|---|---|---|---|---|
+| 0.2:0.175 | −0.537 | −0.44% | −0.48 | +11.2 (wrong sign) |
+| 0.2:0.15 | −1.225 | −1.01% | −1.25 | +22.2 (wrong sign) |
+| 0.2:0.1 | −2.799 | −2.31% | −2.81 | +44.1 (wrong sign) |
+| 0.2:0.05 | −4.938 | −4.08% | −4.69 | (truth only) |
+
+Reaching −5% would need B ≈ 0.04, far from A, so B=0.1 is the large setting.
+
+Each estimator job (`vast/forkall-a020-*.yaml`) runs every variant in one pass: pure LSTD with traces, fork-DQ, and
+fork-TD with L16/L8 modes. Seed 0 is dev and seed 42 is held out, 50 envs each.
+
+## Held-out results (seed 42). Cells: RMSE / bias (% of |ATE|) / right sign
+
+| Estimator | −0.44% (0.175) | −1.01% (0.15) | −2.31% (0.1) |
+|---|---|---|---|
+| Naive | 11.77 / +2192% / 0% | 23.47 / +1916% / 0% | 46.82 / +1673% / 0% |
+| Pure LSTD, paired | 0.85 / +62% / 56% | 1.61 / +79% / 66% | 3.51 / +90% / 48% |
+| **LSTD trace λ=0.5 (dev pick)** | 0.83 / −34% / 84% | 1.20 / +8% / 82% | 2.76 / +26% / 76% |
+| LSTD trace λ=0.8 | 1.06 / −130% / 90% | 1.42 / −72% / 92% | 3.01 / −44% / 90% |
+| Fork-DQ, LSTD tail, H=300 | 0.41 / +56% / 84% | 1.03 / +75% / 78% | 2.42 / +84% / 76% |
+| Fork-DQ, LSTD tail, H=300, jackknife | **0.37 / +39% / 86%** | **0.95 / +63% / 80%** | 2.34 / +79% / 78% |
+| Fork Monte Carlo, H=1000 | 0.49 / +46% / 70% | 0.90 / +55% / 80% | **1.43 / +38% / 96%** |
+| Fork-TD, 8 modes, ridge 1e-4, H=100 | 0.63 / +113% / 36% | 1.36 / +110% / 32% | 3.10 / +110% / 16% |
+
+The dev numbers agree with held-out to within about 15 points of bias.
+
+The dev pick was the estimator with the smallest worst-case |bias| across the three settings. That is the LSTD trace
+estimator with λ=0.5, at most 33% on dev and 34% on held-out.
+
+## Bottom line for Part 5
+
+- **B < A is much easier, and DQ meets every goal there.** With trace λ=0.5:
+  - Naive has the wrong sign in every setting, and this estimator's mean has the right sign.
+  - |bias| is at most 34% of the ATE.
+  - Its RMSE is 14–20× below Naive's.
+  - Per-env sign accuracy is 76–84%.
+- **Fork-DQ and fork Monte Carlo also meet every goal**, with lower RMSE. They fall short of the true effect in Naive's
+  direction by 40–85%, which is still under 100%.
+- **Fork-TD fails here.** It overshoots in Naive's direction, so its mean has the wrong sign.
+- **The ranking flips with the side of A, so no estimator is uniformly best.** On the B > A side (Part 4):
+  - trace λ=0.5 has bias +142% / +158% / +62%;
+  - fork-TD is the best there;
+  - near the peak, the long payback hurts every value model.
+- **B < A is easier because the effect is monotone between A and B.** The noise is also lower: per-env SD at a similar
+  |ATE| is about half its Part 4 value.

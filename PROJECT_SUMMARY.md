@@ -516,6 +516,14 @@ See `LSTD_DQ_REPORT.md` Part 3 and `f_curve.png`. In short:
 - **Infrastructure.** Fork slots must exceed the differing rate × H. At 0.49, 192 slots dropped 24% of forks, so use
   384. Host 38.49.42.46 repeatedly failed setup, and `vastlaunch blacklist` errors with "no such table".
 
+### Part 5: A=0.2 with B below A (2026-10-10)
+
+- B ∈ {0.175, 0.15, 0.1} gives ATE −0.44% / −1.01% / −2.31%. Naive is +11 / +22 / +44, the wrong sign in every setting.
+- LSTD trace λ=0.5 meets every goal on held-out seed 42. Its |bias| is ≤34%, its mean has the right sign, and per-env
+  sign accuracy is 76–84%. RMSE is 0.83 / 1.20 / 2.76 against Naive's 11.8 / 23.5 / 46.8.
+- Fork-DQ H=300 and fork Monte Carlo H=1000 also pass. Fork-TD fails, with bias around +110% (wrong sign).
+- Details are in LSTD_DQ_REPORT.md Part 5.
+
 ## Run log (from 2026-10-08, LSTD-DQ work)
 
 | Job ID | Spec | Purpose / overrides | Output |
@@ -561,3 +569,5 @@ See `LSTD_DQ_REPORT.md` Part 3 and `f_curve.png`. In short:
 | true-private-pig-of-control / sparkling-boisterous-mustang-of-examination (0.385: free-fanatic-turkey + memorable-myrtle-curassow both failed) | xp_gym `vast/forktd4-a020-*.yaml` | fork-TD + busy-time extras, L16/L8/L4, dev | `s3://research/dq/forktd4/<job>/` |
 | sassy-tench-of-lucky-correction | xp_gym `vast/forklong-a020.yaml` | 0.2:0.26 dev, 20 envs, H up to 5000, 192 ghosts, 768 slots: payback horizon | `s3://research/dq/forklong/<job>/` |
 | cyan-seagull-of-unreal-recreation / enchanted-legendary-nightingale-of-symmetry / logical-optimal-gopher-of-experience | xp_gym `vast/forktd3h-a020-*.yaml` | forktd3 config on held-out seed 42 | `s3://research/dq/forktd3/<job>/` |
+| phenomenal-archetypal-tarsier-of-hurricane | xp_gym `vast/ate-a020lo.yaml` | λ(p) truth for A=0.2, B∈{.175,.15,.1,.05} (B below A), 128 envs | `s3://research/dq/ate4/` |
+| steady-laughing-binturong-of-priority / evasive-daft-crayfish-of-nirvana / voracious-ivory-unicorn-of-economy | xp_gym `vast/forkall-a020-{0.175,0.15,0.1}.yaml` | baseline LSTD (traces 0/.5/.8/.9/.95/.97) + fork-DQ + fork-TD L16/L8 h0 × ridges 1e-5..1e-3, horizons 1/30/100/300/1000, 384 slots, 64 ghosts, seeds 0 and 42 | `s3://research/dq/forkall/<job>/` |
