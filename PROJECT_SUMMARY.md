@@ -498,6 +498,24 @@ See `LSTD_DQ_REPORT.md` Part 3 and `f_curve.png`. In short:
   Pure LSTD meets all three goals here, but with a noisy sign. JK and DQ(λ) hurt in every A=0.35 setting.
 - Config `scripts/config/fork_expts.yaml`; job specs `vast/fork-a035-*.yaml`, `vast/fork-long.yaml`.
 
+### Part 4: A=0.2 settings (Naive wrong sign) and fork-TD (2026-10-10)
+
+- **Settings.** A=0.2 sits on the rising side of f(s) (peak 121.69 at s=0.275). The three pairs are 0.2:0.26
+  (+0.49%), 0.2:0.385 (−0.87%) and 0.2:0.49 (−5.05%). Naive is −26.5 at +0.49%, the wrong sign. See
+  `f_curve_a020.png` and LSTD_DQ_REPORT.md Part 4.
+- **Fork-TD (xp_gym `ForkDQEstimator(fork_td=True)`).** The tail value is fitted by LSTD on fork-difference
+  transitions. Options: zone Laplacian basis, daily harmonics, busy-time extras, ridge grid.
+- **Held-out results.**
+  - The 16-mode Laplacian version (ridge 1e-4, H=100) gives bias +2% / RMSE 0.55 at −5.05%, against 6.26 for pure LSTD.
+  - At −0.87% it has the right sign 100% of the time, but with bias about −100 to −170%.
+  - At +0.49% it gets the sign wrong: it recovers about 87% of the long-run payback.
+  - Fork-DQ with the LSTD tail at H=300 is the only variant with the right sign at +0.49% (86%), but it fails at the
+    other two settings.
+- **Payback length.** It lasts about 3000 requests. Reward-only forks reach the truth at H≈3000, but with SD about 2.
+  Every value model is biased toward Naive, and more features make it worse.
+- **Infrastructure.** Fork slots must exceed the differing rate × H. At 0.49, 192 slots dropped 24% of forks, so use
+  384. Host 38.49.42.46 repeatedly failed setup, and `vastlaunch blacklist` errors with "no such table".
+
 ## Run log (from 2026-10-08, LSTD-DQ work)
 
 | Job ID | Spec | Purpose / overrides | Output |
@@ -534,3 +552,12 @@ See `LSTD_DQ_REPORT.md` Part 3 and `f_curve.png`. In short:
 | outrageous-whimsical-mouflon-of-kindness / impressive-auk-of-fabulous-joviality | xp_gym `vast/fork-smoke.yaml` (PAIR=0.35:0.49; fork_ghosts 16 / 48) | ForkDQEstimator smoke: 25 envs × 30k steps, timing + ghost diagnostics (16 ghosts: 97% forks overflow; 48: overflow at mean age ~500) | `s3://research/dq/fork/<job>/smoke_pair0.35:0.49.csv` |
 | noble-precise-terrier-of-pluck / enlightened-glaring-myna-of-satiation / towering-flawless-vulture-of-triumph | xp_gym `vast/fork-a035-{0.49,0.39,0.31}.yaml` | ForkDQEstimator (config `fork_expts`: zones LSTD γ=1 ridge 1e-6, JK 5 blocks, traces 0/.5/.8/.9/.95/.97, fork H∈{1,10,30,100,300,1000}, 192 slots, 64 ghosts) + naive; seeds 0 (dev) and 42 (eval), 50 envs each | `s3://research/dq/fork/<job>/fork_pair0.35:{B}_seed{s}.csv` |
 | legendary-curious-chicken-of-reward | xp_gym `vast/fork-long.yaml` | ForkDQ dev (seed 0) at 0.35:0.31 with H∈{1,30,300,1000,2000,3000}, 128 ghosts, + reward-only forkmc_H outputs: is there payback beyond 1000 steps? | `s3://research/dq/forklong/<job>/` |
+| wandering-loose-pigeon-of-sunshine / fearless-meek-rooster-of-health | xp_gym `vast/f-scan3.yaml`, `vast/f-scan4.yaml` | f(s) at s∈{.125,.15,.175,.2,.21,.24,.25,.26,.29}, 128 CRN envs | `s3://research/dq/fscan/` |
+| gainful-unnatural-goshawk-of-upgrade | xp_gym `vast/ate-a020.yaml` | λ(p) truth for A=0.2, B∈{.26,.385,.49}, 128 envs | `s3://research/dq/ate4/` |
+| poised-roaring-peccary (failed) / helpful-immortal-junglefowl (failed) / greedy-cricket (failed) / unyielding-gainful-panda-of-saturation, memorable-booby-of-pastoral-love, luminous-acoustic-beaver-of-upgrade | xp_gym `vast/fork-a020-{0.26,0.385,0.49}.yaml` | baseline LSTD + fork-DQ (`fork_expts`, 64 ghosts, 192 slots, traces 0/.5/.8/.9/.95/.97), seeds 0 and 42 | `s3://research/dq/fork/<job>/` |
+| speedy-steady-hog (failed) / thoughtful-blue-avocet-of-enrichment, discerning-rampant-lemming-of-gaiety, tidy-real-scallop-of-drizzle | xp_gym `vast/forktd-a020-*.yaml` | fork-TD z63, ridges 1e-6..1, dev seed 0 | `s3://research/dq/forktd/<job>/` |
+| judicious-ethereal-iguana-of-enhancement / likable-exuberant-tody-of-fortitude / attractive-aggressive-lion-of-warranty | xp_gym `vast/forktd2-a020-*.yaml` | fork-TD bases z63/lap32/16/8 × ridges 1e-6..1e-3, dev | `s3://research/dq/forktd2/<job>/` |
+| mottled-zealous-buzzard-of-emphasis / mature-spry-mastiff-of-protection / frisky-unbiased-skylark-of-dignity | xp_gym `vast/forktd3-a020-*.yaml` | fork-TD lap16 × daily harmonics (sub-models L16/L8 × h0/1/2) × ridges 1e-5..1e-3, 384 slots, dev | `s3://research/dq/forktd3/<job>/` |
+| true-private-pig-of-control / sparkling-boisterous-mustang-of-examination (0.385: free-fanatic-turkey + memorable-myrtle-curassow both failed) | xp_gym `vast/forktd4-a020-*.yaml` | fork-TD + busy-time extras, L16/L8/L4, dev | `s3://research/dq/forktd4/<job>/` |
+| sassy-tench-of-lucky-correction | xp_gym `vast/forklong-a020.yaml` | 0.2:0.26 dev, 20 envs, H up to 5000, 192 ghosts, 768 slots: payback horizon | `s3://research/dq/forklong/<job>/` |
+| cyan-seagull-of-unreal-recreation / enchanted-legendary-nightingale-of-symmetry / logical-optimal-gopher-of-experience | xp_gym `vast/forktd3h-a020-*.yaml` | forktd3 config on held-out seed 42 | `s3://research/dq/forktd3/<job>/` |

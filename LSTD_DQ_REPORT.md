@@ -448,3 +448,81 @@ each fork (`forkmc_H`, with U=0).
   2. Tail value features fitted on the forks themselves: forks give exact counterfactual pairs, i.e. labelled value
      differences.
   3. Repeat fork-DQ at A=0 (B=0.1–0.3), where Naive has the wrong sign.
+
+# Part 4: A=0.2, where Naive gets the sign wrong (2026-10-10)
+
+Naive always reads a higher threshold as worse. To make it wrong, A must sit on the **rising** side of f(s), below the
+peak, with a slightly higher B giving +0.5% and larger B values giving the two negative effects (`f_curve_a020.png`).
+
+## Choosing A
+
+A finer f(s) scan (128 CRN envs per point, jobs wandering-loose-pigeon / fearless-meek-rooster) puts the peak at
+121.69 at s=0.275. f(0.2)=121.00, which leaves just enough room for +0.5%. A=0.21 or higher cannot reach +0.5%.
+
+| A:B | ATE | % of f(A) | DQ estimand λ′(0.5) | Naive |
+|---|---|---|---|---|
+| 0.2:0.26 | +0.587 ± 0.048 | **+0.49%** | +0.52 ± 0.11 | **−26.5 (wrong sign)** |
+| 0.2:0.385 | −1.057 ± 0.047 | **−0.87%** | −0.97 ± 0.11 | −80.2 |
+| 0.2:0.49 | −6.108 ± 0.050 | **−5.05%** | −5.73 ± 0.12 | −121.8 |
+
+Truth: job gainful-unnatural-goshawk, 128 envs, λ(p) at p ∈ {0, .3, .7, 1}.
+
+Naive is off by a factor of 20–75. Every DQ variant needs its value term to cancel more than 98% of Naive, so a 2%
+error in the tail value is already as large as the effect at +0.49%.
+
+## Estimators tried (dev seed 0; held-out seed 42; 50 envs each)
+
+1. **Baselines:** pure LSTD paired, JK, DQ(λ), and fork-DQ with the LSTD tail (`fork_H`).
+2. **Fork-TD (new):** the tail value V(real) − V(fork) is fitted by LSTD on the forks' own one-step transitions:
+   ψ_a → ψ_{a+1} with reward r_real − r_fork, where ψ = φ(fork) − φ(real). Both worlds see the same requests, so demand
+   cycles cancel. Its accumulated sums match brute-force forked rollouts exactly (`tests/test_fork_dq_pool.py`).
+
+   Variants explored on dev (jobs forktd/forktd2/forktd3/forktd4):
+
+   | Variant | Result |
+   |---|---|
+   | 63 zones | Unbiased-ish but SD 15–100 (ridge 1e-6), or shrunk toward Naive (ridge ≥ 1e-3) |
+   | Laplacian zone bases (32/16/8/4 modes) | 8–16 modes with ridge 1e-4 is the best trade-off |
+   | Daily Fourier interactions (1–2 harmonics) | No change at all |
+   | Busy-time extras (busy buckets, first-free buckets, busy sums) | Much worse: −1.3 at +0.49%, −11 at −5.05% |
+
+3. **Fork slots.** 192 slots left 24% of differing steps at B=0.49 without a fork. Those fell back to the paired term,
+   which biased every fork estimate there toward Naive. With 384 slots there are no drops.
+
+## Held-out results (seed 42, 50 envs; truth = ATE; RMSE / bias / right sign)
+
+| Estimator | +0.49% (0.2:0.26) | −0.87% (0.2:0.385) | −5.05% (0.2:0.49) |
+|---|---|---|---|
+| Naive | 27.1 / −4617% / **0%** | 79.2 / −7492% / 100% | 115.7 / −1895% / 100% |
+| Pure LSTD paired | 1.71 / −85% / 62% | 5.35 / −159% / 64% | 6.26 / −21% / 92% |
+| Fork-DQ, LSTD tail, H=300 | **0.42 / −17% / 86%** | 2.38 / +204% / 12% | 7.73 / +125% / 16% |
+| Fork-DQ, LSTD tail, H=1000 | 1.90 / −274% / 18% | 4.40 / −387% / 100% | 4.82 / −73% / 100% |
+| Fork-TD, 8 modes, ridge 1e-4, H=100 (dev pick) | 0.89 / −147% / 12% | **1.16 / −103% / 100%** | 1.25 / +19% / 100% |
+| Fork-TD, 16 modes, ridge 1e-4, H=100 | 1.10 / −183% / 2% | 1.82 / −168% / 100% | **0.55 / +2% / 100%** |
+
+Dev numbers agree with held-out to within about 0.1–0.2 for every row.
+
+## Long-horizon diagnostic at 0.2:0.26 (job sassy-tench-of-lucky-correction; 20 envs, 192 ghosts, 768 slots)
+
+| H | 300 | 1000 | 2000 | 3000 | 5000 |
+|---|---|---|---|---|---|
+| Reward-only fork sum (truth +0.59) | −3.34 ± 0.25 | −0.08 ± 0.83 | +0.27 ± 1.73 | +0.52 ± 2.17 | +0.91 ± 2.66 |
+
+- **Payback lasts about 3000 requests (about an hour).** The mean reaches the truth at around 3000.
+- **The SD grows with the horizon.** At H=3000 the sign is right only about 70% of the time.
+- **Ghosts overflow.** 98% of forks overflow 192 ghosts, at a mean age of about 3000.
+
+## Bottom line for Part 4
+
+- **No variant meets all three goals at A=0.2.**
+- **+0.49%, the setting where Naive is wrong:** only fork-DQ with the LSTD tail at H=300 gets the right sign reliably
+  (86%, bias −17%, RMSE 0.42 vs Naive 27). The same estimator gets the sign wrong at −0.87% and has the right sign only
+  16% of the time at −5.05%, so it is not a defensible pick.
+- **Fork-TD fixes the large effect.** At −5.05% it gives bias +2% and RMSE 0.55, 10× better than pure LSTD. At −0.87% it
+  has the right sign 100% of the time (bias −103 to −168%). At +0.49% it still has the wrong sign: it captures about 87%
+  of the long-run payback when 100% is needed.
+- **Every value model is biased toward Naive.** This holds on-trajectory and on forks. Adding features makes it worse,
+  even in fork differences where demand confounding cancels. So the residual looks like a TD/projection effect of a
+  payback that lasts about an hour, not confounding.
+- **Exact Monte Carlo has the opposite problem.** It removes the bias, but the variance at the needed horizon is too
+  large.
