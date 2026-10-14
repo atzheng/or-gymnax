@@ -51,6 +51,17 @@ bd close <id>         # Complete work
 <!-- END BEADS INTEGRATION -->
 
 
+## GPU jobs (vast.ai): tear down your instances
+
+vastlaunch does not reliably destroy instances when jobs finish, fail or get cancelled, and stray
+instances keep billing. When a task that launched GPU jobs is finished (and before ending a session):
+
+1. `vastai show instances` (the `vastai` CLI; key via `vastai set api-key`). vastlaunch labels each
+   instance with the job spec's `name:` field (ours all start with `dq-`).
+2. For every instance you started for the task whose vastlaunch job is `success`/`failed`, or that
+   you cancelled, run `vastai destroy instance <id>`. Do not touch instances you did not start.
+3. Re-run `vastai show instances` and confirm none of yours remain. Note any leftovers in the hand-off.
+
 ## Build & Test
 
 _Add your build and test commands here_
@@ -63,7 +74,7 @@ _Add your build and test commands here_
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+See `PROJECT_SUMMARY.md` for the DQ/DN replication project: estimators, code locations across or-gymnax + xp_gym, how to run on GPU via vastlaunch, and results so far.
 
 ## Conventions & Patterns
 
