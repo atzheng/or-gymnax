@@ -62,6 +62,10 @@ instances keep billing. When a task that launched GPU jobs is finished (and befo
    you cancelled, run `vastai destroy instance <id>`. Do not touch instances you did not start.
 3. Re-run `vastai show instances` and confirm none of yours remain. Note any leftovers in the hand-off.
 
+Also check `dph_total` (`vastai show instances --raw`) right after a job gets a host: vastlaunch takes whatever
+offer is available, and an H100 has come up at $10.82/hr against ~$1/hr for A100_SXM4. Before switching GPU
+type, compare prices with `vastai search offers "gpu_name=<GPU> num_gpus=1 rentable=true" -o dph`.
+
 ## Build & Test
 
 _Add your build and test commands here_
