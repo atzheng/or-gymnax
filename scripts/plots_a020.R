@@ -1,7 +1,7 @@
 # Boxplot of final estimates and RMSE-vs-t (with bootstrap CIs) at A = 0.2, for
 # Naive, TSRI-1/2, OPE-LSTD/GTD/TD and LSTD-DQ(lambda). Held-out seed 42, 50 envs.
 #
-# usage: Rscript scripts/plots_a020.R <dir> [out_prefix]
+# usage: Rscript scripts/plots_a020.R <dir> [out_prefix] [t_box]  (t_box: step for the boxplot, default last)
 # <dir> holds the same CSVs as scripts/box_a020_below.py:
 #   fork_pair0.2:{B}_seed42.csv, ope_pair0.2:{B}.csv, tsri_pair0.2:{B}_mb1.csv
 # Estimates are saved every 10k steps; the row with steps = s is the estimate after
@@ -13,6 +13,7 @@ suppressPackageStartupMessages({
 args <- commandArgs(trailingOnly = TRUE)
 dir <- if (length(args) >= 1) args[1] else "."
 prefix <- if (length(args) >= 2) args[2] else "a020"
+t_box <- if (length(args) >= 3) as.numeric(args[3]) else NA
 chunk <- 10000
 
 settings <- tibble(
@@ -51,7 +52,8 @@ d <- pmap_dfr(settings, function(B, ate, pct, setting) {
          t = steps + chunk)
 
 # ---- boxplot of final estimates ------------------------------------------
-final <- filter(d, t == max(t))
+if (is.na(t_box)) t_box <- max(d$t)
+final <- filter(d, t == t_box)
 truth <- distinct(final, setting, ate)
 p_box <- ggplot(final, aes(estimator, estimate, color = estimator, fill = estimator)) +
   geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
@@ -59,12 +61,13 @@ p_box <- ggplot(final, aes(estimator, estimate, color = estimator, fill = estima
   geom_boxplot(alpha = 0.2, outlier.size = 0.8) +
   stat_summary(fun = mean, geom = "point", shape = 18, size = 2.5) +
   facet_wrap(~setting, nrow = 1, scales = "free_y") +
-  labs(x = NULL, y = "estimate at t = 5e5",
+  labs(x = NULL, y = sprintf("estimate at t = %s", gsub("\\+0?", "", format(t_box, scientific = TRUE))),
        title = "ATE estimates at A = 0.2 (red line: true ATE; diamond: mean)",
        subtitle = "Held-out seed 42, 50 envs") +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
-ggsave(paste0("box_", prefix, ".png"), p_box, width = 15, height = 5.5, dpi = 150, bg = "white")
+box_name <- if (t_box == max(d$t)) paste0("box_", prefix, ".png") else sprintf("box_%s_t%s.png", prefix, gsub("\\+0?", "", format(t_box, scientific = TRUE)))
+ggsave(box_name, p_box, width = 15, height = 5.5, dpi = 150, bg = "white")
 
 # ---- RMSE vs t with percentile-bootstrap CIs over envs ----------------------
 set.seed(1)
