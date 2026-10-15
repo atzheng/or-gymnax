@@ -66,6 +66,11 @@ Also check `dph_total` (`vastai show instances --raw`) right after a job gets a 
 offer is available, and an H100 has come up at $10.82/hr against ~$1/hr for A100_SXM4. Before switching GPU
 type, compare prices with `vastai search offers "gpu_name=<GPU> num_gpus=1 rentable=true" -o dph`.
 
+Also check `gpu_util` and `machine_id` in that output. Machine 117301 (cheapest A100 at $0.71) put five of our jobs on
+one box, where they starved each other's CPUs (gpu_util 0, ~35x slower; the OPE estimators do numpy work on the
+host). vastlaunch has no host filter, but `resources.cpus` is pasted verbatim into the offer query, so
+`cpus: "8 machine_id!=117301"` excludes a machine.
+
 ## Build & Test
 
 _Add your build and test commands here_
