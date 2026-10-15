@@ -1,7 +1,8 @@
 # Boxplot of final estimates and RMSE-vs-t (with bootstrap CIs) at A = 0.2, for
 # Naive, TSRI-1/2, OPE-LSTD/GTD/TD and LSTD-DQ(lambda). Held-out seed 42, 50 envs.
 #
-# usage: Rscript scripts/plots_a020.R <dir> [out_prefix] [t_box]  (t_box: step for the boxplot, default last)
+# usage: Rscript scripts/plots_a020.R [dir] [out_prefix] [t_box]  (t_box: step for the boxplot, default last)
+# dir defaults to data/a020/untuned; fetch it with scripts/fetch_a020_data.sh
 # <dir> holds the same CSVs as scripts/box_a020_below.py:
 #   fork_pair0.2:{B}_seed42.csv, ope_pair0.2:{B}.csv, tsri_pair0.2:{B}_mb1.csv
 # Estimates are saved every 10k steps; the row with steps = s is the estimate after
@@ -11,7 +12,7 @@ suppressPackageStartupMessages({
 })
 
 args <- commandArgs(trailingOnly = TRUE)
-dir <- if (length(args) >= 1) args[1] else "."
+dir <- if (length(args) >= 1) args[1] else "data/a020/untuned"
 prefix <- if (length(args) >= 2) args[2] else "a020"
 t_box <- if (length(args) >= 3) as.numeric(args[3]) else NA
 chunk <- 10000

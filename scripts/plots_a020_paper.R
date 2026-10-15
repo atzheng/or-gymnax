@@ -2,7 +2,8 @@
 # final step) on 10 tuning trajectories; plots and tables use the other 40 trajectories.
 # Held-out seed 42, 50 trajectories = 25 envs x 2 trials; tuning = first 10 (trial, env_id).
 #
-# usage: Rscript scripts/plots_a020_paper.R <dir> [out_prefix]
+# usage: Rscript scripts/plots_a020_paper.R [dir] [out_prefix]
+# dir defaults to data/a020/paper; fetch it with scripts/fetch_a020_data.sh
 # <dir>: fork_pair0.2:{B}_seed42.csv (Naive, LSTD-DQ), and from s3://research/dq/paper/<job>/
 #        ope_pair0.2:{B}.csv and tsri_pair0.2:{B}_mb.csv
 suppressPackageStartupMessages({
@@ -10,7 +11,7 @@ suppressPackageStartupMessages({
 })
 
 args <- commandArgs(trailingOnly = TRUE)
-dir <- if (length(args) >= 1) args[1] else "."
+dir <- if (length(args) >= 1) args[1] else "data/a020/paper"
 prefix <- if (length(args) >= 2) args[2] else "a020_paper"
 chunk <- 10000
 n_tune <- 10
