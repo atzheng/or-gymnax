@@ -6,6 +6,8 @@
 # dir defaults to data/a020/paper; fetch it with scripts/fetch_a020_data.sh
 # <dir>: fork_pair0.2:{B}_seed42.csv (Naive, LSTD-DQ), and from s3://research/dq/paper/<job>/
 #        ope_pair0.2:{B}.csv and tsri_pair0.2:{B}_mb.csv
+#        optional tune_ope_pair0.2:{B}.csv from s3://research/dq/tune/<job>/ope_pair0.2:{B}.csv: the
+#        wider constant-step TD / Diff-GQ1 grid on the same trajectories, pooled into the tuning grid
 suppressPackageStartupMessages({
   library(ggplot2); library(dplyr); library(tidyr); library(readr); library(purrr)
 })
@@ -25,24 +27,35 @@ settings <- tibble(
          setting = factor(setting, levels = setting))
 
 grid_td <- expand_grid(g = c("0.001", "0.01", "0.1", "1"), b = c("0.2", "0.5"))
+# wider grid (vast/tune-ope-a020-b*.yaml): constant steps alpha/D, Rbar ratio beta; GQ helper ratio n
+al_tune <- c("0.003", "0.01", "0.03", "0.1", "0.2", "0.3", "0.5")
+tune_td <- with(expand_grid(a = al_tune, b = c("0.03", "0.1", "0.3")), sprintf("a%s_b%s", a, b))
+tune_gq <- with(expand_grid(a = al_tune, n = c("0.1", "1", "10")), sprintf("a%s_n%s", a, n))
 # family -> file and candidate columns (the hyperparameter grid); one column = no tuning
 fams <- list(
   "Naive"      = list(file = "fork", cols = "naive"),
   "TSRI-1"     = list(file = "tsri", cols = "tsri_tsri1_b0.1983"),
   "TSRI-2"     = list(file = "tsri", cols = "tsri_tsri2_b0.1983"),
   "OPE-LSTD"   = list(file = "ope",  cols = "ope_lstd_cf_r1e-08"),
-  "OPE-GTD"    = list(file = "ope",  cols = paste0("ope_gqit_cf_a", c("0.001", "0.01", "0.1", "1"))),
-  "OPE-TD"     = list(file = "ope",  cols = sprintf("ope_tdit_cf_a%s_b%s", grid_td$g, grid_td$b)),
+  "OPE-GTD"    = list(file = c("ope", "tune"),
+                      cols = c(paste0("ope_gqit_cf_a", c("0.001", "0.01", "0.1", "1")),
+                               paste0("ope_", c("gq", "gqit"), "_cf_", rep(tune_gq, each = 2)))),
+  "OPE-TD"     = list(file = c("ope", "tune"),
+                      cols = c(sprintf("ope_tdit_cf_a%s_b%s", grid_td$g, grid_td$b),
+                               paste0("ope_", c("td", "tdit"), "_cf_", rep(tune_td, each = 2)))),
   "LSTD-DQ(λ)" = list(file = "fork", cols = paste0("lstd_tr", c("0.0", "0.5", "0.8", "0.9", "0.95", "0.97")))
 )
 files <- c(fork = "fork_pair0.2:%s_seed42.csv", ope = "ope_pair0.2:%s.csv",
-           tsri = "tsri_pair0.2:%s_mb.csv")
+           tsri = "tsri_pair0.2:%s_mb.csv", tune = "tune_ope_pair0.2:%s.csv")
 
 long <- pmap_dfr(settings, function(B, ate, pct, setting) {
   map_dfr(names(files), function(f) {
-    cols <- unique(unlist(map(fams, \(x) if (x$file == f) x$cols)))
-    d <- read_csv(file.path(dir, sprintf(files[[f]], B)), show_col_types = FALSE,
+    cols <- unique(unlist(map(fams, \(x) if (f %in% x$file) x$cols)))
+    path <- file.path(dir, sprintf(files[[f]], B))
+    if (f == "tune" && !file.exists(path)) return(NULL)
+    d <- read_csv(path, show_col_types = FALSE,
                   col_select = any_of(c("env_id", "trial", "steps", "t", cols)))
+    cols <- intersect(cols, names(d))
     # stitched files (scripts/stitch_a020_early.R) carry t; otherwise t = steps + chunk
     if (!"t" %in% names(d)) d$t <- d$steps + chunk
     d |>
