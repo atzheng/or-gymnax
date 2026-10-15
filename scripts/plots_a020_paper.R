@@ -41,13 +41,16 @@ files <- c(fork = "fork_pair0.2:%s_seed42.csv", ope = "ope_pair0.2:%s.csv",
 long <- pmap_dfr(settings, function(B, ate, pct, setting) {
   map_dfr(names(files), function(f) {
     cols <- unique(unlist(map(fams, \(x) if (x$file == f) x$cols)))
-    read_csv(file.path(dir, sprintf(files[[f]], B)), show_col_types = FALSE,
-             col_select = all_of(c("env_id", "trial", "steps", cols))) |>
+    d <- read_csv(file.path(dir, sprintf(files[[f]], B)), show_col_types = FALSE,
+                  col_select = any_of(c("env_id", "trial", "steps", "t", cols)))
+    # stitched files (scripts/stitch_a020_early.R) carry t; otherwise t = steps + chunk
+    if (!"t" %in% names(d)) d$t <- d$steps + chunk
+    d |>
       arrange(trial, env_id) |>
       mutate(traj = match(paste(trial, env_id), unique(paste(trial, env_id)))) |>
       pivot_longer(all_of(cols), names_to = "column", values_to = "estimate")
   }) |>
-    mutate(setting = setting, ate = ate, t = steps + chunk)
+    mutate(setting = setting, ate = ate)
 })
 fam_of <- map_dfr(names(fams), \(n) tibble(estimator = n, column = fams[[n]]$cols))
 long <- inner_join(long, fam_of, by = "column", relationship = "many-to-many") |>
@@ -101,12 +104,12 @@ rmse <- d |>
   summarise(boot_rmse(estimate - ate), .groups = "drop")
 write_csv(select(rmse, -ate), paste0("rmse_vs_t_", prefix, ".csv"))
 
-tbreaks <- c(1e4, 3e4, 1e5, 3e5, 5e5)
+tbreaks <- c(1e3, 3e3, 1e4, 3e4, 1e5, 3e5, 5e5)
 p_rmse <- ggplot(rmse, aes(t, rmse, color = estimator, fill = estimator)) +
   geom_hline(data = truth, aes(yintercept = abs(ate)), linetype = "dashed", color = "red") +
   geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, color = NA) +
   geom_line(linewidth = 0.7) +
-  scale_x_log10(breaks = tbreaks, labels = c("1e4", "3e4", "1e5", "3e5", "5e5")) +
+  scale_x_log10(breaks = tbreaks, labels = c("1e3", "3e3", "1e4", "3e4", "1e5", "3e5", "5e5")) +
   scale_y_log10() +
   facet_wrap(~setting, nrow = 2, scales = "free_y") +
   labs(x = "steps t", y = "RMSE vs true ATE",
