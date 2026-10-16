@@ -1,5 +1,7 @@
 estimator,column,n_set,score
 Naive,naive,3,895.0349452395885
+TSRI-1,tsri_tsri1_b0.1983,3,35.40049055347556
+TSRI-2,tsri_tsri2_b0.1983,3,4.1560129598632205
 OPE-LSTD,ope_lstd_cf_r1e-08,3,6.870563070259674
 OPE-GTD,ope_gqit_cf_a0.001,3,768.8473075199682
 OPE-TD,ope_tdit_cf_a0.1_b0.03,3,26.251466202491734
