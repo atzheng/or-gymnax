@@ -16,6 +16,7 @@ B <- if (length(args) >= 2) args[2] else "0.175"
 prefix <- if (length(args) >= 3) args[3] else paste0("a020_long_", B)
 chunk <- 10000
 ate <- c("0.26" = 0.587, "0.175" = -0.537, "0.15" = -1.225, "0.1" = -2.799)[[B]]
+pct <- c("0.26" = 0.49, "0.175" = -0.44, "0.15" = -1.01, "0.1" = -2.31)[[B]]
 
 ests <- c("naive" = "Naive", "ope_lstd_cf_r1e-08" = "OPE-LSTD", "ope_gqit_cf_a0.01" = "OPE-GTD",
           "ope_tdit_cf_a0.01" = "OPE-TD", "lstd_tr0.5" = "LSTD-DQ(λ)")
@@ -45,20 +46,18 @@ rmse <- d |>
 write_csv(rmse, paste0("rmse_vs_t_", prefix, ".csv"))
 
 tbreaks <- c(1e4, 3e4, 1e5, 3e5, 1e6, 3e6, 1e7)
-p <- ggplot(rmse, aes(t, rmse, color = estimator, fill = estimator)) +
-  geom_hline(yintercept = abs(ate), linetype = "dashed", color = "red") +
+# RMSE as a % of |ATE|; facet header = ATE as a % of the A-policy reward
+rmse_pct <- mutate(rmse, across(c(rmse, lo, hi), \(v) 100 * v / abs(ate)), setting = sprintf("ATE %+.2f%%", pct))
+p <- ggplot(rmse_pct, aes(t, rmse, color = estimator, fill = estimator)) +
   geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, color = NA) +
   geom_line(linewidth = 0.7) +
   scale_color_manual(values = pal) + scale_fill_manual(values = pal) +
   scale_x_log10(breaks = tbreaks, labels = c("1e4", "3e4", "1e5", "3e5", "1e6", "3e6", "1e7")) +
-  scale_y_log10() +
+  scale_y_log10(labels = \(x) paste0(format(x, big.mark = ",", scientific = FALSE, trim = TRUE), "%")) +
   # OPE-GTD diverges in some trajectories late in the run; let it run off the top
-  coord_cartesian(ylim = c(min(rmse$lo, na.rm = TRUE), 5 * max(rmse$hi[rmse$estimator == "Naive"]))) +
-  labs(x = "steps t", y = "RMSE vs true ATE",
-       title = sprintf("RMSE vs steps at A = 0.2, B = %s: ATE %+.2f (dashed red: |ATE|)", B, ate),
-       subtitle = sprintf(paste0("Fixed settings: LSTD-DQ λ = 0.5; OPE-TD / OPE-GTD constant step α = 0.01\n",
-                                 "OPE-GTD diverges after ~7e5 (off scale); bands are 95%% bootstrap CIs over %d trajectories"),
-                          max(rmse$n)),
+  coord_cartesian(ylim = c(min(rmse_pct$lo, na.rm = TRUE), 5 * max(rmse_pct$hi[rmse_pct$estimator == "Naive"]))) +
+  facet_wrap(~setting) +
+  labs(x = "steps t", y = "RMSE (% of |ATE|)",
        color = NULL, fill = NULL) +
   theme_minimal() +
   theme(legend.position = "bottom")

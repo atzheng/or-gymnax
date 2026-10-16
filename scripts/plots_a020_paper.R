@@ -5,7 +5,9 @@
 # usage: Rscript scripts/plots_a020_paper.R [dir] [out_prefix] [td_grid]
 # td_grid: "all" (default: paper + constant-step grids) or "const" (OPE-TD tuned over the
 #          constant-step grid only, i.e. among settings whose iterates actually learn)
-# rmse_B:  B values (comma-separated) shown in the RMSE-vs-t plot; default all
+# box_B:   B values (comma-separated) shown in the boxplot; default all
+# rmse_B:  B values shown in the RMSE-vs-t plot; default box_B
+# Facets are labelled by the ATE as a % of the A-policy reward; RMSE is shown as a % of |ATE|.
 # dir defaults to data/a020/paper; fetch it with scripts/fetch_a020_data.sh
 # <dir>: fork_pair0.2:{B}_seed42.csv (Naive, LSTD-DQ), and from s3://research/dq/paper/<job>/
 #        ope_pair0.2:{B}.csv and tsri_pair0.2:{B}_mb.csv
@@ -19,8 +21,8 @@ args <- commandArgs(trailingOnly = TRUE)
 dir <- if (length(args) >= 1) args[1] else "data/a020/paper"
 prefix <- if (length(args) >= 2) args[2] else "a020_paper"
 td_grid <- if (length(args) >= 3) args[3] else "all"
-rmse_B <- if (length(args) >= 4) strsplit(args[4], ",")[[1]] else NULL
-td_note <- if (td_grid == "const") "\nOPE-TD tuned over constant steps only" else ""
+box_B <- if (length(args) >= 4) strsplit(args[4], ",")[[1]] else NULL
+rmse_B <- if (length(args) >= 5) strsplit(args[5], ",")[[1]] else box_B
 chunk <- 10000
 n_tune <- 10
 
@@ -29,7 +31,7 @@ settings <- tibble(
   ate = c(0.587, -0.537, -1.225, -2.799, -6.094),
   pct = c(0.49, -0.44, -1.01, -2.31, -5.04)
 ) |>
-  mutate(setting = sprintf("B = %s: ATE %+.2f (%+.2f%%)", B, ate, pct),
+  mutate(setting = sprintf("ATE %+.2f%%", pct),
          setting = factor(setting, levels = setting))
 
 grid_td <- expand_grid(g = c("0.001", "0.01", "0.1", "1"), b = c("0.2", "0.5"))
@@ -95,19 +97,19 @@ truth <- distinct(settings, setting, ate)
 
 # ---- boxplot of final estimates (evaluation trajectories)
 final <- filter(d, t == tmax)
-p_box <- ggplot(final, aes(estimator, estimate, color = estimator, fill = estimator)) +
+pick_B <- function(x, Bs) if (is.null(Bs)) x else filter(x, setting %in% settings$setting[settings$B %in% Bs])
+box_plot <- pick_B(final, box_B)
+p_box <- ggplot(box_plot, aes(estimator, estimate, color = estimator, fill = estimator)) +
   geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
-  geom_hline(data = truth, aes(yintercept = ate), color = "red", linewidth = 0.6) +
+  geom_hline(data = semi_join(truth, box_plot, by = "setting"), aes(yintercept = ate), color = "red", linewidth = 0.6) +
   geom_boxplot(alpha = 0.2, outlier.size = 0.8) +
   stat_summary(fun = mean, geom = "point", shape = 18, size = 2.5) +
   facet_wrap(~setting, nrow = 1, scales = "free_y") +
-  labs(x = NULL, y = "estimate at t = 5e5",
-       title = "ATE estimates at A = 0.2 (red line: true ATE; diamond: mean)",
-       subtitle = sprintf("Hyperparameters tuned on %d trajectories; %d evaluation trajectories shown (seed 42)%s",
-                          n_tune, length(unique(final$traj)), td_note)) +
+  labs(x = NULL, y = "estimate at t = 5e5") +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
-ggsave(paste0("box_", prefix, ".png"), p_box, width = 17, height = 5.5, dpi = 150, bg = "white")
+n_box <- length(unique(box_plot$setting))
+ggsave(paste0("box_", prefix, ".png"), p_box, width = max(5, 3.4 * n_box), height = 5, dpi = 150, bg = "white")
 
 # ---- RMSE vs t with percentile-bootstrap CIs over evaluation trajectories
 set.seed(1)
@@ -126,20 +128,16 @@ rmse <- d |>
 write_csv(select(rmse, -ate), paste0("rmse_vs_t_", prefix, ".csv"))
 
 tbreaks <- c(1e3, 3e3, 1e4, 3e4, 1e5, 3e5, 5e5)
-rmse_plot <- if (is.null(rmse_B)) rmse else filter(rmse, setting %in% settings$setting[settings$B %in% rmse_B])
+rmse_plot <- pick_B(rmse, rmse_B) |>
+  mutate(across(c(rmse, lo, hi), \(v) 100 * v / abs(ate)))
 n_fac <- length(unique(rmse_plot$setting))
 p_rmse <- ggplot(rmse_plot, aes(t, rmse, color = estimator, fill = estimator)) +
-  geom_hline(data = semi_join(truth, rmse_plot, by = "setting"), aes(yintercept = abs(ate)), linetype = "dashed", color = "red") +
   geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, color = NA) +
   geom_line(linewidth = 0.7) +
   scale_x_log10(breaks = tbreaks, labels = c("1e3", "3e3", "1e4", "3e4", "1e5", "3e5", "5e5")) +
-  scale_y_log10() +
+  scale_y_log10(labels = \(x) paste0(format(x, big.mark = ",", scientific = FALSE, trim = TRUE), "%")) +
   facet_wrap(~setting, nrow = 1, scales = "free_y") +
-  labs(x = "steps t", y = "RMSE vs true ATE",
-       title = "RMSE vs steps at A = 0.2 (dashed red: |ATE|)",
-       subtitle = sprintf("Tuned on %d trajectories; bands are 95%% bootstrap CIs over the other %d%s",
-                          n_tune, max(rmse$n), td_note),
-       color = NULL, fill = NULL) +
+  labs(x = "steps t", y = "RMSE (% of |ATE|)", color = NULL, fill = NULL) +
   theme_minimal() +
   theme(legend.position = "bottom")
 ggsave(paste0("rmse_vs_t_", prefix, ".png"), p_rmse, width = max(7, 3.4 * n_fac), height = 5.5,
