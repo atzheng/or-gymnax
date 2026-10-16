@@ -92,11 +92,23 @@ truth <- distinct(settings, setting, ate)
 
 # ---- boxplot of final estimates
 final <- filter(d, t == tmax)
+# y range is clipped (not filtered, so the boxes use all data); estimators whose median falls
+# outside it get an arrow with the median at the panel edge
+ylim_box <- c(-27, 27)
+off <- final |>
+  group_by(setting, estimator) |>
+  summarise(med = median(estimate), .groups = "drop") |>
+  filter(med < ylim_box[1] | med > ylim_box[2]) |>
+  mutate(y = ifelse(med > 0, ylim_box[2] - 1.5, ylim_box[1] + 1.5),
+         label = sprintf("%s %.0f", ifelse(med > 0, "\u2191", "\u2193"), med))
 p_box <- ggplot(final, aes(estimator, estimate, color = estimator, fill = estimator)) +
   geom_hline(data = truth, aes(yintercept = ate), color = "black", linetype = "dashed", linewidth = 0.5) +
   geom_boxplot(alpha = 0.2, outlier.size = 0.8) +
   stat_summary(fun = mean, geom = "point", shape = 18, size = 2.5) +
+  geom_text(data = off, aes(estimator, y, label = label, color = estimator), inherit.aes = FALSE,
+            size = 3.6, fontface = "bold") +
   facet_wrap(~setting, nrow = 1) +
+  coord_cartesian(ylim = ylim_box) +
   scale_color_manual(values = pal) + scale_fill_manual(values = pal) +
   labs(x = NULL, y = "estimate at t = 5e5") +
   theme_minimal(base_size = 13) +
