@@ -2,7 +2,9 @@
 # final step) on 10 tuning trajectories; plots and tables use the other 40 trajectories.
 # Held-out seed 42, 50 trajectories = 25 envs x 2 trials; tuning = first 10 (trial, env_id).
 #
-# usage: Rscript scripts/plots_a020_paper.R [dir] [out_prefix]
+# usage: Rscript scripts/plots_a020_paper.R [dir] [out_prefix] [td_grid]
+# td_grid: "all" (default: paper + constant-step grids) or "const" (OPE-TD tuned over the
+#          constant-step grid only, i.e. among settings whose iterates actually learn)
 # dir defaults to data/a020/paper; fetch it with scripts/fetch_a020_data.sh
 # <dir>: fork_pair0.2:{B}_seed42.csv (Naive, LSTD-DQ), and from s3://research/dq/paper/<job>/
 #        ope_pair0.2:{B}.csv and tsri_pair0.2:{B}_mb.csv
@@ -15,6 +17,8 @@ suppressPackageStartupMessages({
 args <- commandArgs(trailingOnly = TRUE)
 dir <- if (length(args) >= 1) args[1] else "data/a020/paper"
 prefix <- if (length(args) >= 2) args[2] else "a020_paper"
+td_grid <- if (length(args) >= 3) args[3] else "all"
+td_note <- if (td_grid == "const") "; OPE-TD tuned over constant steps only" else ""
 chunk <- 10000
 n_tune <- 10
 
@@ -45,6 +49,8 @@ fams <- list(
                                paste0("ope_", c("td", "tdit"), "_cf_", rep(tune_td, each = 2)))),
   "LSTD-DQ(λ)" = list(file = "fork", cols = paste0("lstd_tr", c("0.0", "0.5", "0.8", "0.9", "0.95", "0.97")))
 )
+if (td_grid == "const")
+  fams[["OPE-TD"]] <- list(file = "tune", cols = paste0("ope_", c("td", "tdit"), "_cf_", rep(tune_td, each = 2)))
 files <- c(fork = "fork_pair0.2:%s_seed42.csv", ope = "ope_pair0.2:%s.csv",
            tsri = "tsri_pair0.2:%s_mb.csv", tune = "tune_ope_pair0.2:%s.csv")
 
@@ -95,8 +101,8 @@ p_box <- ggplot(final, aes(estimator, estimate, color = estimator, fill = estima
   facet_wrap(~setting, nrow = 2, scales = "free_y") +
   labs(x = NULL, y = "estimate at t = 5e5",
        title = "ATE estimates at A = 0.2 (red line: true ATE; diamond: mean)",
-       subtitle = sprintf("Hyperparameters tuned on %d trajectories; %d evaluation trajectories shown (seed 42)",
-                          n_tune, length(unique(final$traj)))) +
+       subtitle = sprintf("Hyperparameters tuned on %d trajectories; %d evaluation trajectories shown (seed 42)%s",
+                          n_tune, length(unique(final$traj)), td_note)) +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
 ggsave(paste0("box_", prefix, ".png"), p_box, width = 13, height = 9, dpi = 150, bg = "white")
@@ -127,8 +133,8 @@ p_rmse <- ggplot(rmse, aes(t, rmse, color = estimator, fill = estimator)) +
   facet_wrap(~setting, nrow = 2, scales = "free_y") +
   labs(x = "steps t", y = "RMSE vs true ATE",
        title = "RMSE vs steps at A = 0.2 (dashed red: |ATE|)",
-       subtitle = sprintf("Tuned on %d trajectories; bands are 95%% bootstrap CIs over the other %d",
-                          n_tune, max(rmse$n)),
+       subtitle = sprintf("Tuned on %d trajectories; bands are 95%% bootstrap CIs over the other %d%s",
+                          n_tune, max(rmse$n), td_note),
        color = NULL, fill = NULL) +
   theme_minimal() +
   theme(legend.position = "bottom")
