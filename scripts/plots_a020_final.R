@@ -93,17 +93,16 @@ truth <- distinct(settings, setting, ate)
 # ---- boxplot of final estimates
 final <- filter(d, t == tmax)
 p_box <- ggplot(final, aes(estimator, estimate, color = estimator, fill = estimator)) +
-  geom_hline(yintercept = 0, linetype = "dotted", color = "grey50") +
-  geom_hline(data = truth, aes(yintercept = ate), color = "red", linewidth = 0.6) +
+  geom_hline(data = truth, aes(yintercept = ate), color = "black", linetype = "dashed", linewidth = 0.5) +
   geom_boxplot(alpha = 0.2, outlier.size = 0.8) +
   stat_summary(fun = mean, geom = "point", shape = 18, size = 2.5) +
-  facet_wrap(~setting, nrow = 1, scales = "free_y") +
+  facet_wrap(~setting, nrow = 1) +
   scale_color_manual(values = pal) + scale_fill_manual(values = pal) +
   labs(x = NULL, y = "estimate at t = 5e5") +
-  theme_minimal() +
+  theme_minimal(base_size = 13) +
   theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
 for (ext in c("png", "pdf"))
-  ggsave(paste0("box_", prefix, ".", ext), p_box, width = 3.4 * nrow(settings), height = 5,
+  ggsave(paste0("box_", prefix, ".", ext), p_box, width = 2.7 * nrow(settings), height = 3.6,
          dpi = 150, bg = "white", device = if (ext == "pdf") cairo_pdf else NULL)
 
 # ---- RMSE (% of |ATE|) vs t with percentile-bootstrap CIs over evaluation trajectories
@@ -125,20 +124,21 @@ write_csv(select(rmse, -ate), paste0("rmse_vs_t_", prefix, ".csv"))
 rmse_plot <- rmse |>
   filter(setting %in% settings$setting[settings$B %in% rmse_B]) |>
   mutate(across(c(rmse, lo, hi), \(v) 100 * v / abs(ate)))
-tbreaks <- c(1e4, 3e4, 1e5, 3e5, 5e5)
+tbreaks <- c(1e4, 3e4, 1e5, 5e5)
 p_rmse <- ggplot(rmse_plot, aes(t, rmse, color = estimator, fill = estimator)) +
   geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, color = NA) +
   geom_line(linewidth = 0.7) +
-  scale_x_log10(breaks = tbreaks, labels = c("1e4", "3e4", "1e5", "3e5", "5e5")) +
+  scale_x_log10(breaks = tbreaks, labels = c("1e4", "3e4", "1e5", "5e5")) +
   scale_y_log10(labels = \(x) paste0(format(x, big.mark = ",", scientific = FALSE, trim = TRUE), "%")) +
   facet_wrap(~setting, nrow = 1, scales = "free_y") +
   scale_color_manual(values = pal) + scale_fill_manual(values = pal) +
   labs(x = "steps t", y = "RMSE (% of |ATE|)", color = NULL, fill = NULL) +
-  theme_minimal() +
-  theme(legend.position = "bottom")
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "right", legend.text = element_text(size = 11),
+        legend.key.size = unit(0.45, "cm"))
 n_fac <- length(unique(rmse_plot$setting))
 for (ext in c("png", "pdf"))
-  ggsave(paste0("rmse_vs_t_", prefix, ".", ext), p_rmse, width = max(7, 3.4 * n_fac), height = 5.5,
+  ggsave(paste0("rmse_vs_t_", prefix, ".", ext), p_rmse, width = 5.4 * n_fac, height = 3.6,
          dpi = 150, bg = "white", device = if (ext == "pdf") cairo_pdf else NULL)
 
 # ---- summary at the final step
