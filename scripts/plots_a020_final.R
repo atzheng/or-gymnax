@@ -4,10 +4,11 @@
 #
 # Hyperparameters: ONE value per estimator for all settings, minimizing the relative MSE
 # (MSE / ATE^2, at the final step, averaged over the settings) on the tuning trajectories.
-#   LSTD-DQ(λ): λ = 0.8 (fixed)       OPE-LSTD: ridge 1e-8 (no tuning)
+#   LSTD-DQ(λ): λ = 0.8, ridge 1e-4 (fixed; dqridge_pair0.2:{B}.csv)   OPE-LSTD: ridge 1e-8 (no tuning)
 #   OPE-TD: constant steps α/D, α x Rbar ratio β (tune_ope_pair0.2:{B}.csv)
 #   OPE-GTD: Diff-GQ1, paper grid α (ope_pair0.2:{B}.csv) and α x helper ratio (tune file)
-#   TSRI-1/2: market-balance design, k in {1, 2}, from the fixed TSR runs (tsri_fix_pair0.2:{B}_mb.csv)
+#   TSRI-1/2: market-balance design, k in {1, 2}, from the fixed TSR runs (tsri_fix_pair0.2:{B}_mb.csv;
+#             left out if those files are missing)
 #
 # usage: Rscript scripts/plots_a020_final.R [dir] [out_prefix] [rmse_B]
 # dir defaults to data/a020/paper; fetch it with scripts/fetch_a020_data.sh
@@ -39,7 +40,7 @@ fams <- tribble(
   "TSRI-1",     "tsri", "tsri_tsri1_b0.1983",
   "TSRI-2",     "tsri", "tsri_tsri2_b0.1983",
   "OPE-LSTD",   "ope",  "ope_lstd_cf_r1e-08",
-  "LSTD-DQ(λ)", "fork", "lstd_tr0.8"
+  "LSTD-DQ(λ)", "dqridge", "lstd_tr0.8_r0.0001"
 ) |>
   bind_rows(tibble(estimator = "OPE-GTD", file = "ope",
                    column = paste0("ope_gqit_cf_a", c("0.001", "0.01", "0.1", "1"))),
@@ -48,13 +49,18 @@ fams <- tribble(
             tibble(estimator = "OPE-TD", file = "tune",
                    column = paste0("ope_", c("td", "tdit"), "_cf_", rep(tune_td, each = 2))))
 est_levels <- c("Naive", "TSRI-1", "TSRI-2", "OPE-LSTD", "OPE-GTD", "OPE-TD", "LSTD-DQ(λ)")
+# fixed colours, so an estimator keeps its colour when others are missing
+pal <- setNames(scales::hue_pal()(length(est_levels)), est_levels)
 files <- c(fork = "fork_pair0.2:%s_seed42.csv", ope = "ope_pair0.2:%s.csv",
-           tsri = "tsri_fix_pair0.2:%s_mb.csv", tune = "tune_ope_pair0.2:%s.csv")
+           tsri = "tsri_fix_pair0.2:%s_mb.csv", tune = "tune_ope_pair0.2:%s.csv",
+           dqridge = "dqridge_pair0.2:%s.csv")
 
 long <- pmap_dfr(settings, function(B, ate, pct, setting) {
   map_dfr(names(files), function(f) {
     cols <- unique(fams$column[fams$file == f])
-    read_csv(file.path(dir, sprintf(files[[f]], B)), show_col_types = FALSE,
+    path <- file.path(dir, sprintf(files[[f]], B))
+    if (f == "tsri" && !file.exists(path)) return(NULL)
+    read_csv(path, show_col_types = FALSE,
              col_select = any_of(c("env_id", "trial", "steps", cols))) |>
       arrange(trial, env_id) |>
       mutate(traj = match(paste(trial, env_id), unique(paste(trial, env_id))), t = steps + chunk) |>
@@ -64,7 +70,7 @@ long <- pmap_dfr(settings, function(B, ate, pct, setting) {
     mutate(setting = setting, ate = ate)
 }) |>
   inner_join(fams, by = c("file", "column")) |>
-  mutate(estimator = factor(estimator, levels = est_levels))
+  mutate(estimator = factor(estimator, levels = intersect(est_levels, estimator)))
 
 # ---- tuning: one column per estimator across settings (mean relative MSE on tuning trajectories)
 tmax <- max(long$t)
@@ -90,6 +96,7 @@ p_box <- ggplot(final, aes(estimator, estimate, color = estimator, fill = estima
   geom_boxplot(alpha = 0.2, outlier.size = 0.8) +
   stat_summary(fun = mean, geom = "point", shape = 18, size = 2.5) +
   facet_wrap(~setting, nrow = 1, scales = "free_y") +
+  scale_color_manual(values = pal) + scale_fill_manual(values = pal) +
   labs(x = NULL, y = "estimate at t = 5e5") +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
@@ -123,6 +130,7 @@ p_rmse <- ggplot(rmse_plot, aes(t, rmse, color = estimator, fill = estimator)) +
   scale_x_log10(breaks = tbreaks, labels = c("1e4", "3e4", "1e5", "3e5", "5e5")) +
   scale_y_log10(labels = \(x) paste0(format(x, big.mark = ",", scientific = FALSE, trim = TRUE), "%")) +
   facet_wrap(~setting, nrow = 1, scales = "free_y") +
+  scale_color_manual(values = pal) + scale_fill_manual(values = pal) +
   labs(x = "steps t", y = "RMSE (% of |ATE|)", color = NULL, fill = NULL) +
   theme_minimal() +
   theme(legend.position = "bottom")
