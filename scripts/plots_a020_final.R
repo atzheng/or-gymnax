@@ -3,14 +3,15 @@
 # the first 10 (trial, env_id) are for tuning, the other 40 are shown.
 #
 # Hyperparameters: ONE value per estimator for all settings, minimizing the relative MSE
-# (MSE / ATE^2, at the final step, averaged over the settings) on the tuning trajectories.
+# (MSE / ATE^2, at the final step) on the tuning trajectories of the setting(s) in tune_B
+# (default: the largest effect, B = 0.025, ATE -5.04%).
 #   LSTD-DQ(λ): λ = 0.8, ridge 1e-4 (fixed; dqridge_pair0.2:{B}.csv)   OPE-LSTD: ridge 1e-8 (no tuning)
 #   OPE-TD: constant steps α/D, α x Rbar ratio β (tune_ope_pair0.2:{B}.csv)
 #   OPE-GTD: Diff-GQ1, paper grid α (ope_pair0.2:{B}.csv) and α x helper ratio (tune file)
 #   TSRI-1/2: market-balance design, k in {1, 2}, from the fixed TSR runs (tsri_fix_pair0.2:{B}_mb.csv;
 #             left out if those files are missing)
 #
-# usage: Rscript scripts/plots_a020_final.R [dir] [out_prefix] [rmse_B]
+# usage: Rscript scripts/plots_a020_final.R [dir] [out_prefix] [rmse_B] [tune_B]
 # dir defaults to data/a020/paper; fetch it with scripts/fetch_a020_data.sh
 suppressPackageStartupMessages({
   library(ggplot2); library(dplyr); library(tidyr); library(readr); library(purrr)
@@ -20,6 +21,7 @@ args <- commandArgs(trailingOnly = TRUE)
 dir <- if (length(args) >= 1) args[1] else "data/a020/paper"
 prefix <- if (length(args) >= 2) args[2] else "a020_final"
 rmse_B <- if (length(args) >= 3) strsplit(args[3], ",")[[1]] else "0.025"
+tune_B <- if (length(args) >= 4) strsplit(args[4], ",")[[1]] else "0.025"
 chunk <- 10000
 n_tune <- 10
 
@@ -75,15 +77,15 @@ long <- pmap_dfr(settings, function(B, ate, pct, setting) {
 # ---- tuning: one column per estimator across settings (mean relative MSE on tuning trajectories)
 tmax <- max(long$t)
 scores <- long |>
-  filter(t == tmax, traj <= n_tune) |>
+  filter(t == tmax, traj <= n_tune, setting %in% settings$setting[settings$B %in% tune_B]) |>
   group_by(estimator, column, setting) |>
   summarise(rel_mse = mean((estimate - ate)^2) / first(ate)^2, .groups = "drop") |>
   group_by(estimator, column) |>
   summarise(n_set = n(), score = mean(rel_mse), .groups = "drop") |>
-  filter(n_set == nrow(settings), is.finite(score))
+  filter(n_set == length(tune_B), is.finite(score))
 picks <- scores |> group_by(estimator) |> slice_min(score, n = 1, with_ties = FALSE) |> ungroup()
 write_csv(picks, paste0("picks_", prefix, ".csv"))
-cat("Picked (one per estimator, all settings):\n"); print(as.data.frame(picks), right = FALSE)
+cat("Picked (one per estimator, tuned at B =", tune_B, "):\n"); print(as.data.frame(picks), right = FALSE)
 
 d <- semi_join(long, picks, by = c("estimator", "column")) |> filter(traj > n_tune)
 truth <- distinct(settings, setting, ate)
