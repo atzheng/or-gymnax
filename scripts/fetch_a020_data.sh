@@ -8,7 +8,7 @@
 set -euo pipefail
 export AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL:-https://bc0a4d3391012c4fb52a9e8e78724da1.r2.cloudflarestorage.com}
 root=$(cd "$(dirname "$0")/.." && pwd)
-for d in untuned paper paper_stitched early_0.025; do
+for d in untuned paper paper_stitched early_0.025 long; do
   aws s3 cp --recursive --only-show-errors "s3://research/dq/a020_inputs/$d/" "$root/data/a020/$d/"
 done
 ls "$root"/data/a020/*

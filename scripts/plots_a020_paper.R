@@ -5,6 +5,7 @@
 # usage: Rscript scripts/plots_a020_paper.R [dir] [out_prefix] [td_grid]
 # td_grid: "all" (default: paper + constant-step grids) or "const" (OPE-TD tuned over the
 #          constant-step grid only, i.e. among settings whose iterates actually learn)
+# rmse_B:  B values (comma-separated) shown in the RMSE-vs-t plot; default all
 # dir defaults to data/a020/paper; fetch it with scripts/fetch_a020_data.sh
 # <dir>: fork_pair0.2:{B}_seed42.csv (Naive, LSTD-DQ), and from s3://research/dq/paper/<job>/
 #        ope_pair0.2:{B}.csv and tsri_pair0.2:{B}_mb.csv
@@ -18,14 +19,15 @@ args <- commandArgs(trailingOnly = TRUE)
 dir <- if (length(args) >= 1) args[1] else "data/a020/paper"
 prefix <- if (length(args) >= 2) args[2] else "a020_paper"
 td_grid <- if (length(args) >= 3) args[3] else "all"
-td_note <- if (td_grid == "const") "; OPE-TD tuned over constant steps only" else ""
+rmse_B <- if (length(args) >= 4) strsplit(args[4], ",")[[1]] else NULL
+td_note <- if (td_grid == "const") "\nOPE-TD tuned over constant steps only" else ""
 chunk <- 10000
 n_tune <- 10
 
 settings <- tibble(
-  B   = c("0.26", "0.175", "0.15", "0.1", "0.025", "0.49"),
-  ate = c(0.587, -0.537, -1.225, -2.799, -6.094, -6.108),
-  pct = c(0.49, -0.44, -1.01, -2.31, -5.04, -5.05)
+  B   = c("0.26", "0.175", "0.15", "0.1", "0.025"),
+  ate = c(0.587, -0.537, -1.225, -2.799, -6.094),
+  pct = c(0.49, -0.44, -1.01, -2.31, -5.04)
 ) |>
   mutate(setting = sprintf("B = %s: ATE %+.2f (%+.2f%%)", B, ate, pct),
          setting = factor(setting, levels = setting))
@@ -98,14 +100,14 @@ p_box <- ggplot(final, aes(estimator, estimate, color = estimator, fill = estima
   geom_hline(data = truth, aes(yintercept = ate), color = "red", linewidth = 0.6) +
   geom_boxplot(alpha = 0.2, outlier.size = 0.8) +
   stat_summary(fun = mean, geom = "point", shape = 18, size = 2.5) +
-  facet_wrap(~setting, nrow = 2, scales = "free_y") +
+  facet_wrap(~setting, nrow = 1, scales = "free_y") +
   labs(x = NULL, y = "estimate at t = 5e5",
        title = "ATE estimates at A = 0.2 (red line: true ATE; diamond: mean)",
        subtitle = sprintf("Hyperparameters tuned on %d trajectories; %d evaluation trajectories shown (seed 42)%s",
                           n_tune, length(unique(final$traj)), td_note)) +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
-ggsave(paste0("box_", prefix, ".png"), p_box, width = 13, height = 9, dpi = 150, bg = "white")
+ggsave(paste0("box_", prefix, ".png"), p_box, width = 17, height = 5.5, dpi = 150, bg = "white")
 
 # ---- RMSE vs t with percentile-bootstrap CIs over evaluation trajectories
 set.seed(1)
@@ -124,13 +126,15 @@ rmse <- d |>
 write_csv(select(rmse, -ate), paste0("rmse_vs_t_", prefix, ".csv"))
 
 tbreaks <- c(1e3, 3e3, 1e4, 3e4, 1e5, 3e5, 5e5)
-p_rmse <- ggplot(rmse, aes(t, rmse, color = estimator, fill = estimator)) +
-  geom_hline(data = truth, aes(yintercept = abs(ate)), linetype = "dashed", color = "red") +
+rmse_plot <- if (is.null(rmse_B)) rmse else filter(rmse, setting %in% settings$setting[settings$B %in% rmse_B])
+n_fac <- length(unique(rmse_plot$setting))
+p_rmse <- ggplot(rmse_plot, aes(t, rmse, color = estimator, fill = estimator)) +
+  geom_hline(data = semi_join(truth, rmse_plot, by = "setting"), aes(yintercept = abs(ate)), linetype = "dashed", color = "red") +
   geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.15, color = NA) +
   geom_line(linewidth = 0.7) +
   scale_x_log10(breaks = tbreaks, labels = c("1e3", "3e3", "1e4", "3e4", "1e5", "3e5", "5e5")) +
   scale_y_log10() +
-  facet_wrap(~setting, nrow = 2, scales = "free_y") +
+  facet_wrap(~setting, nrow = 1, scales = "free_y") +
   labs(x = "steps t", y = "RMSE vs true ATE",
        title = "RMSE vs steps at A = 0.2 (dashed red: |ATE|)",
        subtitle = sprintf("Tuned on %d trajectories; bands are 95%% bootstrap CIs over the other %d%s",
@@ -138,7 +142,8 @@ p_rmse <- ggplot(rmse, aes(t, rmse, color = estimator, fill = estimator)) +
        color = NULL, fill = NULL) +
   theme_minimal() +
   theme(legend.position = "bottom")
-ggsave(paste0("rmse_vs_t_", prefix, ".png"), p_rmse, width = 13, height = 9, dpi = 150, bg = "white")
+ggsave(paste0("rmse_vs_t_", prefix, ".png"), p_rmse, width = max(7, 3.4 * n_fac), height = 5.5,
+       dpi = 150, bg = "white")
 
 # ---- summary table at the final step (evaluation trajectories)
 summ <- final |>
